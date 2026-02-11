@@ -1,0 +1,356 @@
+#!/usr/bin/env python3
+"""
+Automated Claude Code + Codex review loop.
+
+Usage:
+    review-loop "implement feature X"
+    review-loop --max-iter 3 "fix the bug in parser"
+    review-loop --claude-model opus --codex-model o3 "refactor auth module"
+    review-loop --dry-run "show what would happen"
+
+Works from any git repository directory.
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+# ── Defaults ──────────────────────────────────────────────────────────────────
+
+MAX_ITERATIONS = 5
+CLAUDE_MODEL = "opus"
+CODEX_MODEL = None  # use codex default
+TIMEOUT_CLAUDE = 600  # 10 min
+TIMEOUT_CODEX = 180  # 3 min
+
+# ── Colors ────────────────────────────────────────────────────────────────────
+
+CYAN = "\033[36m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+RED = "\033[31m"
+DIM = "\033[2m"
+RESET = "\033[0m"
+BOLD = "\033[1m"
+
+
+def log(color, prefix, msg):
+    print(f"{color}{BOLD}[{prefix}]{RESET} {msg}", flush=True)
+
+
+def log_claude(msg):
+    log(CYAN, "claude", msg)
+
+
+def log_codex(msg):
+    log(YELLOW, "codex", msg)
+
+
+def log_ok(msg):
+    log(GREEN, "✓", msg)
+
+
+def log_err(msg):
+    log(RED, "✗", msg)
+
+
+# ── Git helpers ───────────────────────────────────────────────────────────────
+
+def git_root():
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "--show-toplevel"], text=True, stderr=subprocess.DEVNULL
+        ).strip()
+    except subprocess.CalledProcessError:
+        return None
+
+
+def git_head():
+    return subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], text=True
+    ).strip()
+
+
+def git_log_oneline(n=1):
+    return subprocess.check_output(
+        ["git", "log", f"--oneline", f"-{n}"], text=True
+    ).strip()
+
+
+def git_project_name():
+    root = git_root()
+    if root:
+        return Path(root).name
+    return "unknown"
+
+
+# ── Claude Code ───────────────────────────────────────────────────────────────
+
+def run_claude(prompt, session_id=None, model=None, timeout=TIMEOUT_CLAUDE, dry_run=False):
+    """Run Claude Code non-interactively. Returns (session_id, output_text)."""
+    cmd = [
+        "claude", "-p", prompt,
+        "--output-format", "json",
+        "--dangerously-skip-permissions",
+    ]
+    if session_id:
+        cmd.extend(["--resume", session_id])
+    if model:
+        cmd.extend(["--model", model])
+
+    if dry_run:
+        log_claude(f"DRY RUN: {' '.join(cmd[:6])}...")
+        return "dry-run-session", "[dry run]"
+
+    log_claude(f"Running... (timeout {timeout}s)")
+    start = time.time()
+
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout
+        )
+    except subprocess.TimeoutExpired:
+        log_err(f"Claude timed out after {timeout}s")
+        return session_id, None
+
+    elapsed = time.time() - start
+    log_claude(f"Done in {elapsed:.0f}s")
+
+    if result.returncode != 0:
+        log_err(f"Claude error (exit {result.returncode})")
+        if result.stderr:
+            print(f"{DIM}{result.stderr[:500]}{RESET}")
+        return session_id, None
+
+    # Parse JSON output to get session_id
+    sid = session_id
+    output_text = result.stdout
+    try:
+        data = json.loads(result.stdout)
+        sid = data.get("session_id", session_id)
+        output_text = data.get("result", result.stdout)
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    return sid, output_text
+
+
+# ── Codex Review ──────────────────────────────────────────────────────────────
+
+def run_codex_review(commit_sha, model=None, timeout=TIMEOUT_CODEX, dry_run=False):
+    """Run Codex review on a commit. Returns (has_issues: bool, review_text: str)."""
+    output_file = "/tmp/codex-review-output.txt"
+
+    cmd = ["codex", "review", "--commit", commit_sha, "-o", output_file]
+    if model:
+        cmd.extend(["-m", model])
+
+    if dry_run:
+        log_codex(f"DRY RUN: {' '.join(cmd)}")
+        return False, "No issues (dry run)"
+
+    log_codex(f"Reviewing commit {commit_sha[:8]}...")
+    start = time.time()
+
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout
+        )
+    except subprocess.TimeoutExpired:
+        log_err(f"Codex timed out after {timeout}s")
+        return False, "Review timed out"
+
+    elapsed = time.time() - start
+    log_codex(f"Done in {elapsed:.0f}s")
+
+    # Read output file
+    review_text = ""
+    if os.path.exists(output_file):
+        review_text = Path(output_file).read_text().strip()
+    elif result.stdout:
+        review_text = result.stdout.strip()
+
+    if not review_text:
+        review_text = result.stderr.strip() if result.stderr else "Empty review"
+
+    # Detect if review has actionable issues
+    has_issues = _review_has_issues(review_text)
+
+    return has_issues, review_text
+
+
+def _review_has_issues(review_text: str) -> bool:
+    """Heuristic: does the review contain actionable findings?"""
+    lower = review_text.lower()
+
+    # Clean pass indicators
+    clean_signals = [
+        "no issues found",
+        "no actionable issues",
+        "no significant issues",
+        "looks good",
+        "lgtm",
+        "no bugs",
+        "no problems",
+        "clean",
+        "no concerns",
+        "approved",
+    ]
+    for signal in clean_signals:
+        if signal in lower:
+            return False
+
+    # Issue indicators
+    issue_signals = [
+        "bug",
+        "issue",
+        "error",
+        "vulnerability",
+        "missing",
+        "incorrect",
+        "should",
+        "must",
+        "fix",
+        "problem",
+        "concern",
+        "risk",
+        "todo",
+        "warning",
+        "critical",
+        "major",
+        "severity",
+    ]
+    issue_count = sum(1 for s in issue_signals if s in lower)
+
+    # If 3+ issue signals found, likely has real issues
+    return issue_count >= 3
+
+
+# ── Main Loop ─────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Automated Claude Code + Codex review loop",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  rl "implement retry logic for API calls"
+  rl --max-iter 3 "fix the parser bug"
+  rl --claude-model sonnet "quick refactor"
+  rl --dry-run "test the workflow"
+        """,
+    )
+    parser.add_argument("task", help="Task description for Claude Code")
+    parser.add_argument(
+        "--max-iter", type=int, default=MAX_ITERATIONS,
+        help=f"Maximum review iterations (default: {MAX_ITERATIONS})"
+    )
+    parser.add_argument("--claude-model", default=CLAUDE_MODEL, help=f"Claude model (default: {CLAUDE_MODEL})")
+    parser.add_argument("--codex-model", default=CODEX_MODEL, help="Codex model (default: codex default)")
+    parser.add_argument("--timeout-claude", type=int, default=TIMEOUT_CLAUDE, help="Claude timeout in seconds")
+    parser.add_argument("--timeout-codex", type=int, default=TIMEOUT_CODEX, help="Codex timeout in seconds")
+    parser.add_argument("--no-commit", action="store_true", help="Don't ask Claude to commit (just implement)")
+    parser.add_argument("--dry-run", action="store_true", help="Show what would happen without running")
+    args = parser.parse_args()
+
+    # Verify we're in a git repo
+    root = git_root()
+    if not root:
+        log_err("Not in a git repository. Run from a project directory.")
+        sys.exit(1)
+
+    project = git_project_name()
+    print(f"\n{BOLD}Review Loop{RESET} — {CYAN}{project}{RESET} ({root})")
+    print(f"Max iterations: {args.max_iter} | Claude: {args.claude_model} | Codex: {args.codex_model or 'default'}")
+    print(f"{'─' * 60}\n")
+
+    # Step 1: Claude implements the task
+    commit_instruction = "" if args.no_commit else "\n\nAfter implementing, create a git commit (no push)."
+    implement_prompt = f"{args.task}{commit_instruction}"
+
+    log_claude(f"Implementing: {args.task[:80]}...")
+    session_id, output = run_claude(
+        implement_prompt,
+        model=args.claude_model,
+        timeout=args.timeout_claude,
+        dry_run=args.dry_run,
+    )
+
+    if output is None and not args.dry_run:
+        log_err("Claude failed to implement. Aborting.")
+        sys.exit(1)
+
+    commit_hash = git_head()
+    log_claude(f"Commit: {git_log_oneline()}")
+
+    # Step 2-N: Review loop
+    for iteration in range(1, args.max_iter + 1):
+        print(f"\n{'─' * 60}")
+        print(f"{BOLD}Iteration {iteration}/{args.max_iter}{RESET}\n")
+
+        # Codex reviews
+        has_issues, review_text = run_codex_review(
+            commit_hash,
+            model=args.codex_model,
+            timeout=args.timeout_codex,
+            dry_run=args.dry_run,
+        )
+
+        if not has_issues:
+            print(f"\n{GREEN}{BOLD}{'─' * 60}{RESET}")
+            log_ok(f"Review PASSED on iteration {iteration}. No issues found.")
+            print(f"\n{DIM}Review output:{RESET}")
+            print(f"{DIM}{review_text[:500]}{RESET}")
+            break
+
+        # Show findings
+        log_codex(f"Issues found. Review output:")
+        print(f"\n{DIM}{review_text[:2000]}{RESET}\n")
+
+        # Feed back to Claude
+        fix_prompt = (
+            f"The code reviewer (Codex) found issues in your last commit ({commit_hash[:8]}).\n"
+            f"Fix ALL issues below and commit again (no push).\n\n"
+            f"--- REVIEW OUTPUT ---\n{review_text}\n--- END REVIEW ---"
+        )
+
+        log_claude(f"Fixing issues (iteration {iteration})...")
+        session_id, output = run_claude(
+            fix_prompt,
+            session_id=session_id,
+            model=args.claude_model,
+            timeout=args.timeout_claude,
+            dry_run=args.dry_run,
+        )
+
+        if output is None and not args.dry_run:
+            log_err("Claude failed to fix. Aborting.")
+            break
+
+        # Check new commit
+        new_hash = git_head()
+        if new_hash == commit_hash and not args.dry_run:
+            log_err("Claude did not create a new commit. Aborting to prevent infinite loop.")
+            break
+        commit_hash = new_hash
+        log_claude(f"New commit: {git_log_oneline()}")
+    else:
+        print(f"\n{YELLOW}{BOLD}{'─' * 60}{RESET}")
+        log_err(f"Max iterations ({args.max_iter}) reached. Review loop stopped.")
+
+    # Summary
+    print(f"\n{'─' * 60}")
+    print(f"{BOLD}Summary{RESET}")
+    print(f"  Project:  {project}")
+    print(f"  Commits:  {git_log_oneline(min(iteration + 1, 10))}")
+    print(f"  Session:  {session_id}")
+    print()
+
+
+if __name__ == "__main__":
+    main()
