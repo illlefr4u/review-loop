@@ -98,7 +98,7 @@ def git_changed_files(commit="HEAD"):
     """Get list of files changed in a commit."""
     try:
         return subprocess.check_output(
-            ["git", "diff-tree", "--no-commit-id", "--name-only", "-r", commit],
+            ["git", "diff-tree", "--no-commit-id", "--name-only", "-r", "--root", "-m", commit],
             text=True, stderr=subprocess.DEVNULL
         ).strip().splitlines()
     except subprocess.CalledProcessError:
@@ -276,27 +276,40 @@ def _review_has_issues(review_text: str) -> bool:
 def _arch_review_has_issues(review_text: str) -> bool:
     """Check if architecture review contains P1/P2/P3 findings."""
     import re
-    lower = review_text.lower()
 
-    # Clean signals - must check BEFORE counting markers
+    # Match P1/P2/P3 in common finding formats:
+    #   P1 ...  |  **P1** ...  |  [P1] ...  |  - P1 ...  |  - [P2] ...  |  1. P3 ...
+    findings = re.findall(
+        r'(?:^|\n)\s*(?:[-*\d.]+\s*)?(?:\[?\**P[123]\**\]?)\b',
+        review_text
+    )
+
+    if not findings:
+        # No P1/P2/P3 markers at all - fall back to general heuristic
+        return _review_has_issues(review_text)
+
+    # Markers found - but check if they only appear in clean summary phrases
+    lower = review_text.lower()
     clean_signals = [
         "no p1/p2/p3 findings",
         "no p1/p2/p3",
         "no findings",
-        "no issues",
-        "no actionable",
-        "lgtm",
-        "looks good",
-        "approved",
     ]
     for signal in clean_signals:
         if signal in lower:
-            return False
+            # Clean signal found - but only trust it if there are no actual
+            # finding-formatted lines (the signal itself doesn't count)
+            # Strip lines containing clean signals before rechecking
+            filtered = "\n".join(
+                line for line in review_text.splitlines()
+                if signal not in line.lower()
+            )
+            recheck = re.findall(
+                r'(?:^|\n)\s*(?:[-*\d.]+\s*)?(?:\[?\**P[123]\**\]?)\b',
+                filtered
+            )
+            return len(recheck) > 0
 
-    # Only count P1/P2/P3 at start of line or after whitespace (actual findings)
-    findings = re.findall(r'(?:^|\n)\s*\**P[123]\b', review_text)
-    if not findings:
-        return _review_has_issues(review_text)
     return True
 
 
