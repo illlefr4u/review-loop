@@ -97,10 +97,11 @@ def git_project_name():
 def git_changed_files(commit="HEAD"):
     """Get list of files changed in a commit."""
     try:
-        return subprocess.check_output(
+        lines = subprocess.check_output(
             ["git", "diff-tree", "--no-commit-id", "--name-only", "-r", "--root", "-m", commit],
             text=True, stderr=subprocess.DEVNULL
         ).strip().splitlines()
+        return list(dict.fromkeys(lines))
     except subprocess.CalledProcessError:
         return []
 
@@ -288,27 +289,19 @@ def _arch_review_has_issues(review_text: str) -> bool:
         # No P1/P2/P3 markers at all - fall back to general heuristic
         return _review_has_issues(review_text)
 
-    # Markers found - but check if they only appear in clean summary phrases
-    lower = review_text.lower()
-    clean_signals = [
-        "no p1/p2/p3 findings",
-        "no p1/p2/p3",
-        "no findings",
+    # Markers found - check if ALL of them are inside clean summary phrases
+    # A clean summary is a line that does NOT start with a finding prefix
+    finding_pattern = re.compile(
+        r'^\s*(?:[-*\d.]+\s*)?(?:\[?\**P[123]\**\]?)\b'
+    )
+    finding_lines = [
+        line for line in review_text.splitlines()
+        if finding_pattern.match(line)
     ]
-    for signal in clean_signals:
-        if signal in lower:
-            # Clean signal found - but only trust it if there are no actual
-            # finding-formatted lines (the signal itself doesn't count)
-            # Strip lines containing clean signals before rechecking
-            filtered = "\n".join(
-                line for line in review_text.splitlines()
-                if signal not in line.lower()
-            )
-            recheck = re.findall(
-                r'(?:^|\n)\s*(?:[-*\d.]+\s*)?(?:\[?\**P[123]\**\]?)\b',
-                filtered
-            )
-            return len(recheck) > 0
+
+    if not finding_lines:
+        # Markers exist but not in finding-formatted lines (e.g. "No P1/P2/P3 findings")
+        return False
 
     return True
 
