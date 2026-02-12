@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+"""
+Wrapper to run Codex review from within Claude Code.
+Claude Code should call this via Bash, NOT review code/plans itself.
+
+Usage:
+    codex-review                    # code review (last commit)
+    codex-review --arch             # architecture review
+    codex-review --commit abc123    # review specific commit
+"""
+
+import argparse
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+OUTPUT_FILE = "/tmp/codex-review.txt"
+TIMEOUT = 300
+
+ARCH_PROMPT = (
+    "Review the provided architecture plan and output findings only as "
+    "P1/P2/P3 with section references, focused on implementation and operational risks."
+)
+
+
+def git_changed_files(commit="HEAD"):
+    try:
+        lines = subprocess.check_output(
+            ["git", "diff-tree", "--no-commit-id", "--name-only", "-r", "--root", "-m", commit],
+            text=True, stderr=subprocess.DEVNULL
+        ).strip().splitlines()
+        return list(dict.fromkeys(lines))
+    except subprocess.CalledProcessError:
+        return []
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Run Codex review")
+    parser.add_argument("--arch", action="store_true", help="Architecture review mode")
+    parser.add_argument("--commit", default="HEAD", help="Commit to review (default: HEAD)")
+    args = parser.parse_args()
+
+    # Clean previous output
+    if os.path.exists(OUTPUT_FILE):
+        os.remove(OUTPUT_FILE)
+
+    if args.arch:
+        changed = git_changed_files(args.commit)
+        prompt = ARCH_PROMPT
+        if changed:
+            prompt = f"Focus on these files from the last commit: {', '.join(changed)}. {prompt}"
+        cmd = ["codex", "exec", prompt, "-o", OUTPUT_FILE]
+        print(f"Running architecture review ({len(changed)} files)...")
+    else:
+        cmd = ["codex", "review", "--commit", args.commit, "-o", OUTPUT_FILE]
+        print(f"Running code review on {args.commit[:8]}...")
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=TIMEOUT)
+    except subprocess.TimeoutExpired:
+        print(f"ERROR: Codex timed out after {TIMEOUT}s", file=sys.stderr)
+        sys.exit(1)
+
+    if result.returncode != 0 and result.stderr:
+        print(f"Codex stderr: {result.stderr[:500]}", file=sys.stderr)
+
+    # Read and print output
+    if os.path.exists(OUTPUT_FILE):
+        output = Path(OUTPUT_FILE).read_text().strip()
+        print(f"\n{output}")
+    elif result.stdout:
+        output = result.stdout.strip()
+        print(f"\n{output}")
+        Path(OUTPUT_FILE).write_text(output)
+    else:
+        print("No output from Codex", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
