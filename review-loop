@@ -94,6 +94,17 @@ def git_project_name():
     return "unknown"
 
 
+def git_changed_files(commit="HEAD"):
+    """Get list of files changed in a commit."""
+    try:
+        return subprocess.check_output(
+            ["git", "diff-tree", "--no-commit-id", "--name-only", "-r", commit],
+            text=True, stderr=subprocess.DEVNULL
+        ).strip().splitlines()
+    except subprocess.CalledProcessError:
+        return []
+
+
 # ── Claude Code ───────────────────────────────────────────────────────────────
 
 def run_claude(prompt, session_id=None, model=None, timeout=TIMEOUT_CLAUDE, dry_run=False):
@@ -153,12 +164,14 @@ def run_codex_review(commit_sha, model=None, timeout=TIMEOUT_CODEX, dry_run=Fals
                       review_commit=commit_sha)
 
 
-def run_codex_arch_review(model=None, timeout=TIMEOUT_CODEX, dry_run=False):
+def run_codex_arch_review(target_files=None, model=None, timeout=TIMEOUT_CODEX, dry_run=False):
     """Run Codex architecture review on current repo state. Returns (has_issues: bool, review_text: str)."""
-    return _run_codex("arch", model=model, timeout=timeout, dry_run=dry_run)
+    return _run_codex("arch", model=model, timeout=timeout, dry_run=dry_run,
+                      target_files=target_files)
 
 
-def _run_codex(mode, model=None, timeout=TIMEOUT_CODEX, dry_run=False, review_commit=None):
+def _run_codex(mode, model=None, timeout=TIMEOUT_CODEX, dry_run=False, review_commit=None,
+               target_files=None):
     """Run Codex in review or arch mode. Returns (has_issues: bool, review_text: str)."""
     output_file = "/tmp/codex-review-output.txt"
 
@@ -166,8 +179,12 @@ def _run_codex(mode, model=None, timeout=TIMEOUT_CODEX, dry_run=False, review_co
         cmd = ["codex", "review", "--commit", review_commit, "-o", output_file]
         label = f"Reviewing commit {review_commit[:8]}..."
     else:
-        cmd = ["codex", "exec", ARCH_REVIEW_PROMPT, "-o", output_file]
-        label = "Reviewing architecture..."
+        prompt = ARCH_REVIEW_PROMPT
+        if target_files:
+            files_str = ", ".join(target_files)
+            prompt = f"Focus on these files from the last commit: {files_str}. {prompt}"
+        cmd = ["codex", "exec", prompt, "-o", output_file]
+        label = f"Reviewing architecture ({len(target_files or [])} files)..."
 
     if model:
         cmd.extend(["-m", model])
@@ -259,9 +276,26 @@ def _review_has_issues(review_text: str) -> bool:
 def _arch_review_has_issues(review_text: str) -> bool:
     """Check if architecture review contains P1/P2/P3 findings."""
     import re
-    findings = re.findall(r'\bP[123]\b', review_text)
+    lower = review_text.lower()
+
+    # Clean signals - must check BEFORE counting markers
+    clean_signals = [
+        "no p1/p2/p3 findings",
+        "no p1/p2/p3",
+        "no findings",
+        "no issues",
+        "no actionable",
+        "lgtm",
+        "looks good",
+        "approved",
+    ]
+    for signal in clean_signals:
+        if signal in lower:
+            return False
+
+    # Only count P1/P2/P3 at start of line or after whitespace (actual findings)
+    findings = re.findall(r'(?:^|\n)\s*\**P[123]\b', review_text)
     if not findings:
-        # No P1/P2/P3 markers - fall back to general heuristic
         return _review_has_issues(review_text)
     return True
 
@@ -332,7 +366,9 @@ Examples:
 
         # Codex reviews
         if args.arch:
+            changed = git_changed_files(commit_hash)
             has_issues, review_text = run_codex_arch_review(
+                target_files=changed,
                 model=args.codex_model,
                 timeout=args.timeout_codex,
                 dry_run=args.dry_run,
