@@ -28,6 +28,11 @@ CODEX_MODEL = None  # use codex default
 TIMEOUT_CLAUDE = 600  # 10 min
 TIMEOUT_CODEX = 180  # 3 min
 
+ARCH_REVIEW_PROMPT = (
+    "Review the provided architecture plan and output findings only as "
+    "P1/P2/P3 with section references, focused on implementation and operational risks."
+)
+
 # ── Colors ────────────────────────────────────────────────────────────────────
 
 CYAN = "\033[36m"
@@ -143,18 +148,35 @@ def run_claude(prompt, session_id=None, model=None, timeout=TIMEOUT_CLAUDE, dry_
 # ── Codex Review ──────────────────────────────────────────────────────────────
 
 def run_codex_review(commit_sha, model=None, timeout=TIMEOUT_CODEX, dry_run=False):
-    """Run Codex review on a commit. Returns (has_issues: bool, review_text: str)."""
+    """Run Codex code review on a commit. Returns (has_issues: bool, review_text: str)."""
+    return _run_codex("review", model=model, timeout=timeout, dry_run=dry_run,
+                      review_commit=commit_sha)
+
+
+def run_codex_arch_review(model=None, timeout=TIMEOUT_CODEX, dry_run=False):
+    """Run Codex architecture review on current repo state. Returns (has_issues: bool, review_text: str)."""
+    return _run_codex("arch", model=model, timeout=timeout, dry_run=dry_run)
+
+
+def _run_codex(mode, model=None, timeout=TIMEOUT_CODEX, dry_run=False, review_commit=None):
+    """Run Codex in review or arch mode. Returns (has_issues: bool, review_text: str)."""
     output_file = "/tmp/codex-review-output.txt"
 
-    cmd = ["codex", "review", "--commit", commit_sha, "-o", output_file]
+    if mode == "review":
+        cmd = ["codex", "review", "--commit", review_commit, "-o", output_file]
+        label = f"Reviewing commit {review_commit[:8]}..."
+    else:
+        cmd = ["codex", "exec", ARCH_REVIEW_PROMPT, "-o", output_file]
+        label = "Reviewing architecture..."
+
     if model:
         cmd.extend(["-m", model])
 
     if dry_run:
-        log_codex(f"DRY RUN: {' '.join(cmd)}")
+        log_codex(f"DRY RUN: {' '.join(cmd[:6])}...")
         return False, "No issues (dry run)"
 
-    log_codex(f"Reviewing commit {commit_sha[:8]}...")
+    log_codex(label)
     start = time.time()
 
     try:
@@ -179,13 +201,16 @@ def run_codex_review(commit_sha, model=None, timeout=TIMEOUT_CODEX, dry_run=Fals
         review_text = result.stderr.strip() if result.stderr else "Empty review"
 
     # Detect if review has actionable issues
-    has_issues = _review_has_issues(review_text)
+    if mode == "arch":
+        has_issues = _arch_review_has_issues(review_text)
+    else:
+        has_issues = _review_has_issues(review_text)
 
     return has_issues, review_text
 
 
 def _review_has_issues(review_text: str) -> bool:
-    """Heuristic: does the review contain actionable findings?"""
+    """Heuristic: does the code review contain actionable findings?"""
     lower = review_text.lower()
 
     # Clean pass indicators
@@ -231,6 +256,16 @@ def _review_has_issues(review_text: str) -> bool:
     return issue_count >= 3
 
 
+def _arch_review_has_issues(review_text: str) -> bool:
+    """Check if architecture review contains P1/P2/P3 findings."""
+    import re
+    findings = re.findall(r'\bP[123]\b', review_text)
+    if not findings:
+        # No P1/P2/P3 markers - fall back to general heuristic
+        return _review_has_issues(review_text)
+    return True
+
+
 # ── Main Loop ─────────────────────────────────────────────────────────────────
 
 def main():
@@ -254,6 +289,7 @@ Examples:
     parser.add_argument("--codex-model", default=CODEX_MODEL, help="Codex model (default: codex default)")
     parser.add_argument("--timeout-claude", type=int, default=TIMEOUT_CLAUDE, help="Claude timeout in seconds")
     parser.add_argument("--timeout-codex", type=int, default=TIMEOUT_CODEX, help="Codex timeout in seconds")
+    parser.add_argument("--arch", action="store_true", help="Architecture review mode (plan review, not code)")
     parser.add_argument("--no-commit", action="store_true", help="Don't ask Claude to commit (just implement)")
     parser.add_argument("--dry-run", action="store_true", help="Show what would happen without running")
     args = parser.parse_args()
@@ -265,7 +301,8 @@ Examples:
         sys.exit(1)
 
     project = git_project_name()
-    print(f"\n{BOLD}Review Loop{RESET} — {CYAN}{project}{RESET} ({root})")
+    mode_label = "Architecture Review" if args.arch else "Code Review"
+    print(f"\n{BOLD}Review Loop ({mode_label}){RESET} — {CYAN}{project}{RESET} ({root})")
     print(f"Max iterations: {args.max_iter} | Claude: {args.claude_model} | Codex: {args.codex_model or 'default'}")
     print(f"{'─' * 60}\n")
 
@@ -294,12 +331,19 @@ Examples:
         print(f"{BOLD}Iteration {iteration}/{args.max_iter}{RESET}\n")
 
         # Codex reviews
-        has_issues, review_text = run_codex_review(
-            commit_hash,
-            model=args.codex_model,
-            timeout=args.timeout_codex,
-            dry_run=args.dry_run,
-        )
+        if args.arch:
+            has_issues, review_text = run_codex_arch_review(
+                model=args.codex_model,
+                timeout=args.timeout_codex,
+                dry_run=args.dry_run,
+            )
+        else:
+            has_issues, review_text = run_codex_review(
+                commit_hash,
+                model=args.codex_model,
+                timeout=args.timeout_codex,
+                dry_run=args.dry_run,
+            )
 
         if not has_issues:
             print(f"\n{GREEN}{BOLD}{'─' * 60}{RESET}")
@@ -313,11 +357,18 @@ Examples:
         print(f"\n{DIM}{review_text[:2000]}{RESET}\n")
 
         # Feed back to Claude
-        fix_prompt = (
-            f"The code reviewer (Codex) found issues in your last commit ({commit_hash[:8]}).\n"
-            f"Fix ALL issues below and commit again (no push).\n\n"
-            f"--- REVIEW OUTPUT ---\n{review_text}\n--- END REVIEW ---"
-        )
+        if args.arch:
+            fix_prompt = (
+                f"The architecture reviewer (Codex) found issues in the plan.\n"
+                f"Address ALL P1/P2/P3 findings below, revise the plan, and commit again (no push).\n\n"
+                f"--- ARCHITECTURE REVIEW ---\n{review_text}\n--- END REVIEW ---"
+            )
+        else:
+            fix_prompt = (
+                f"The code reviewer (Codex) found issues in your last commit ({commit_hash[:8]}).\n"
+                f"Fix ALL issues below and commit again (no push).\n\n"
+                f"--- REVIEW OUTPUT ---\n{review_text}\n--- END REVIEW ---"
+            )
 
         log_claude(f"Fixing issues (iteration {iteration})...")
         session_id, output = run_claude(
