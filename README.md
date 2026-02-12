@@ -26,7 +26,7 @@ Issues found? --NO--> Done
 [Claude Code] --> fixes issues + commits (same session)
     |
     v
-Loop (max 5 iterations)
+Loop (max 10 iterations)
 ```
 
 Key details:
@@ -78,7 +78,7 @@ review-loop --dry-run "test what would happen"
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--arch` | false | Architecture review mode (P1/P2/P3) |
-| `--max-iter` | 5 | Maximum review iterations |
+| `--max-iter` | 10 | Maximum review iterations |
 | `--claude-model` | opus | Claude model to use |
 | `--codex-model` | (default) | Codex model to use |
 | `--timeout-claude` | 600 | Claude timeout in seconds |
@@ -101,7 +101,7 @@ You can also use this workflow directly inside a Claude Code session without the
 3. Read the review output
 4. If no actionable issues: done
 5. If issues found: fix all, commit, go to step 2
-6. Max 5 iterations
+6. Max 10 iterations
 
 ### review-arch (Codex Architecture Review Loop)
 
@@ -110,7 +110,7 @@ You can also use this workflow directly inside a Claude Code session without the
 3. Read the review output
 4. If no P1/P2/P3 findings: done
 5. If findings: address all, revise plan, commit, go to step 2
-6. Max 5 iterations
+6. Max 10 iterations
 ```
 
 Then just say `review` or `review-arch` after Claude implements your task or writes a plan.

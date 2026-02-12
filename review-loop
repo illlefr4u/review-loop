@@ -22,7 +22,7 @@ from pathlib import Path
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 
-MAX_ITERATIONS = 5
+MAX_ITERATIONS = 10
 CLAUDE_MODEL = "opus"
 CODEX_MODEL = None  # use codex default
 TIMEOUT_CLAUDE = 600  # 10 min
