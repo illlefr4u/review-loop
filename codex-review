@@ -7,6 +7,15 @@ Usage:
     codex-review                    # code review (last commit)
     codex-review --arch             # architecture review
     codex-review --commit abc123    # review specific commit
+    codex-review --unpushed         # review all unpushed commits vs origin
+    codex-review --pin abc123       # review INSIDE a temp worktree pinned at SHA
+                                    # (HEAD-drift-safe in shared/multi-session repos;
+                                    #  worktree is created and cleaned up automatically)
+
+Runtime: internal watchdog TIMEOUT=900s (override: CODEX_REVIEW_TIMEOUT env, seconds —
+поднимать для крупных диффов). Callers (Claude Code Bash tool) must NOT set a
+smaller outer timeout — run in background and wait for completion instead (a 5-min outer
+timeout killed a healthy review mid-run, real fail 2026-07-11).
 """
 
 import argparse
@@ -16,12 +25,55 @@ import sys
 from pathlib import Path
 
 OUTPUT_FILE = "/tmp/codex-review.txt"
-TIMEOUT = 300
+# Крупные диффы (сотни строк money-кода в одном коммите) не укладываются в 900с
+# и падают «ERROR: Codex timed out» — это не вердикт, а потерянный гейт.
+# Ручка: CODEX_REVIEW_TIMEOUT=1800 codex-review --pin <sha>. Дефолт не менялся.
+TIMEOUT = int(os.environ.get("CODEX_REVIEW_TIMEOUT", "900"))
 
 ARCH_PROMPT = (
-    "Review the provided architecture plan and output findings only as "
-    "P1/P2/P3 with section references, focused on implementation and operational risks."
+    "Review the provided architecture plan. Output ONLY architecture-level findings "
+    "(design decisions, invariant violations, missing failure modes, structural risks). "
+    "Do NOT report code-level issues (error handling of specific calls, variable naming, "
+    "try_send/.ok() patterns, specific function signatures) — those belong in code review. "
+    "Do NOT report documentation/wording inconsistencies unless they create ambiguity "
+    "that would cause incorrect implementation. "
+    "Classify as P1 (will cause data loss, financial loss, or safety violation), "
+    "P2 (operational risk, degraded reliability), P3 (improvement, defense-in-depth). "
+    "If there are no P1 findings, explicitly state 'No P1 findings.' at the top."
 )
+
+
+def git_unpushed_base():
+    """Find the base ref for unpushed commits (remote tracking branch or origin/HEAD)."""
+    try:
+        base = subprocess.check_output(
+            ["git", "rev-parse", "--abbrev-ref", "@{push}"],
+            text=True, stderr=subprocess.DEVNULL
+        ).strip()
+        if base:
+            return base
+    except subprocess.CalledProcessError:
+        pass
+    try:
+        branch = subprocess.check_output(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            text=True, stderr=subprocess.DEVNULL
+        ).strip()
+        return f"origin/{branch}"
+    except subprocess.CalledProcessError:
+        return "origin/master"
+
+
+def git_unpushed_count(base):
+    """Count commits ahead of base."""
+    try:
+        output = subprocess.check_output(
+            ["git", "rev-list", "--count", f"{base}..HEAD"],
+            text=True, stderr=subprocess.DEVNULL
+        ).strip()
+        return int(output)
+    except (subprocess.CalledProcessError, ValueError):
+        return 0
 
 
 def git_changed_files(commit="HEAD"):
@@ -39,41 +91,123 @@ def main():
     parser = argparse.ArgumentParser(description="Run Codex review")
     parser.add_argument("--arch", action="store_true", help="Architecture review mode")
     parser.add_argument("--commit", default="HEAD", help="Commit to review (default: HEAD)")
+    parser.add_argument("--unpushed", action="store_true", help="Review all unpushed commits vs origin")
+    parser.add_argument("--pin", metavar="SHA",
+                        help="Run inside a temporary detached worktree at SHA (auto-cleanup). "
+                             "Use in shared repos so a parallel session's HEAD move cannot swap "
+                             "the reviewed commit. Implies --commit SHA unless --commit is given.")
     args = parser.parse_args()
 
     # Clean previous output
     if os.path.exists(OUTPUT_FILE):
         os.remove(OUTPUT_FILE)
 
+    # --pin: create a detached worktree at SHA and run the whole review from inside it.
+    # Cleanup is registered via atexit so every exit path (timeout, codex failure, Ctrl-C)
+    # removes the worktree; `git worktree remove` is invoked with an explicit -C <origrepo>
+    # so it works regardless of the cwd at exit time.
+    if args.pin:
+        import atexit
+        import tempfile
+        orig_repo = os.getcwd()
+        tmpdir = tempfile.mkdtemp(prefix="codex-pin-")
+        try:
+            subprocess.check_output(
+                ["git", "-C", orig_repo, "worktree", "add", "--detach", tmpdir, args.pin],
+                stderr=subprocess.STDOUT, text=True)
+        except subprocess.CalledProcessError as e:
+            print(f"ERROR: cannot pin worktree at {args.pin}: {e.output.strip()[:300]}",
+                  file=sys.stderr)
+            sys.exit(1)
+
+        def _cleanup_pin():
+            subprocess.run(["git", "-C", orig_repo, "worktree", "remove", "--force", tmpdir],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        atexit.register(_cleanup_pin)
+        os.chdir(tmpdir)
+        if args.commit == "HEAD":         # default -> review the pinned commit itself
+            args.commit = args.pin
+        print(f"Pinned worktree at {args.pin[:12]} ({tmpdir})")
+
     if args.arch:
         changed = git_changed_files(args.commit)
         prompt = ARCH_PROMPT
         if changed:
             prompt = f"Focus on these files from the last commit: {', '.join(changed)}. {prompt}"
-        cmd = ["codex", "exec", prompt, "-o", OUTPUT_FILE]
+        cmd = ["codex", "exec", prompt]
         print(f"Running architecture review ({len(changed)} files)...")
+    elif args.unpushed:
+        base = git_unpushed_base()
+        count = git_unpushed_count(base)
+        if count == 0:
+            print(f"No unpushed commits vs {base}")
+            sys.exit(0)
+        cmd = ["codex", "review", "--base", base]
+        print(f"Running code review on {count} unpushed commits vs {base}...")
     else:
-        cmd = ["codex", "review", "--commit", args.commit, "-o", OUTPUT_FILE]
-        print(f"Running code review on {args.commit[:8]}...")
+        changed = git_changed_files(args.commit)
+        cmd = ["codex", "review", "--commit", args.commit]
+        print(f"Running code review on {args.commit[:8]} ({len(changed)} files)...")
+
+    # Stream output in real-time while capturing to file.
+    # capture_output=True buffers everything — on large codebases with gpt-5.4/xhigh
+    # this means 7-10 min of silence before any output, making it look hung.
+    import threading
+    import time
+
+    stdout_lines = []
+    stderr_chunks = []
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=TIMEOUT)
-    except subprocess.TimeoutExpired:
-        print(f"ERROR: Codex timed out after {TIMEOUT}s", file=sys.stderr)
+        with open(OUTPUT_FILE, "w") as outf:
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+
+            # Read stdout in worker thread (blocks on readline)
+            def read_stdout():
+                for line in proc.stdout:
+                    sys.stdout.write(line)
+                    sys.stdout.flush()
+                    outf.write(line)
+                    outf.flush()
+                    stdout_lines.append(line)
+
+            # Drain stderr in background thread to prevent pipe buffer deadlock
+            def drain_stderr():
+                for line in proc.stderr:
+                    stderr_chunks.append(line)
+
+            t_out = threading.Thread(target=read_stdout, daemon=True)
+            t_err = threading.Thread(target=drain_stderr, daemon=True)
+            t_out.start()
+            t_err.start()
+
+            # Main thread = watchdog
+            t_out.join(timeout=TIMEOUT)
+            if t_out.is_alive():
+                proc.kill()
+                proc.wait()
+                print(f"\nERROR: Codex timed out after {TIMEOUT}s", file=sys.stderr)
+                sys.exit(1)
+
+            proc.wait()
+            t_err.join(timeout=5)
+    except Exception as e:
+        print(f"ERROR: {e}", file=sys.stderr)
         sys.exit(1)
 
-    if result.returncode != 0 and result.stderr:
-        print(f"Codex stderr: {result.stderr[:500]}", file=sys.stderr)
+    has_output = bool(stdout_lines)
 
-    # Read and print output
-    if os.path.exists(OUTPUT_FILE):
-        output = Path(OUTPUT_FILE).read_text().strip()
-        print(f"\n{output}")
-    elif result.stdout:
-        output = result.stdout.strip()
-        print(f"\n{output}")
-        Path(OUTPUT_FILE).write_text(output)
-    else:
+    if proc.returncode != 0:
+        stderr_msg = "".join(stderr_chunks).strip()
+        if stderr_msg:
+            print(f"\nCodex failed (exit {proc.returncode}): {stderr_msg[:500]}", file=sys.stderr)
+        if not has_output:
+            sys.exit(1)
+
+    if not has_output:
         print("No output from Codex", file=sys.stderr)
         sys.exit(1)
 
