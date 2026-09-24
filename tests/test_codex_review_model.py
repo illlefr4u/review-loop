@@ -2,7 +2,8 @@
 
 Контракт `~/bin/codex-review` (скрипт без расширения, грузится как модуль):
 - константы `REVIEW_MODEL == "gpt-6-sol"`, `REVIEW_EFFORT == "xhigh"`;
-- `model_args(env=None) -> list[str]` = ["-c", 'model="<m>"', "-c", 'model_reasoning_effort="<e>"']; переменные окружения
+- `model_args(env=None) -> list[str]` = ["-c", 'model="<m>"', "-c", 'review_model="<m>"', "-c",
+  'model_reasoning_effort="<e>"'] (`codex review` читает `review_model` раньше `model`); переменные окружения
   `CODEX_REVIEW_MODEL` / `CODEX_REVIEW_EFFORT` переопределяют (пустая строка = нет переопределения);
 - `build_cmd(mode, *, commit=None, base=None, prompt=None, env=None)`: "commit" → codex review <model_args> --commit SHA,
   "unpushed" → codex review <model_args> --base BASE, "arch" → codex exec <model_args> PROMPT; `main()` запускает ровно его;
@@ -34,9 +35,11 @@ def test_pinned_constants():
 
 def test_model_args_default_and_env_override():
     m = load()
-    assert m.model_args({}) == ["-c", 'model="gpt-6-sol"', "-c", 'model_reasoning_effort="xhigh"']
+    # `codex review` берёт `review_model` раньше `model` (codex P2 на 5562737): задаём оба
+    assert m.model_args({}) == ["-c", 'model="gpt-6-sol"', "-c", 'review_model="gpt-6-sol"',
+                                "-c", 'model_reasoning_effort="xhigh"']
     assert m.model_args({"CODEX_REVIEW_MODEL": "gpt-6-astra", "CODEX_REVIEW_EFFORT": "high"}) == \
-        ["-c", 'model="gpt-6-astra"', "-c", 'model_reasoning_effort="high"']
+        ["-c", 'model="gpt-6-astra"', "-c", 'review_model="gpt-6-astra"', "-c", 'model_reasoning_effort="high"']
     assert m.model_args({"CODEX_REVIEW_MODEL": "", "CODEX_REVIEW_EFFORT": ""}) == m.model_args({})
 
 
