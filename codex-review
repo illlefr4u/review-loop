@@ -60,7 +60,11 @@ def _model_config(env=None):
 def model_args(env=None):
     """Build explicit Codex configuration arguments for review runs."""
     model, effort = _model_config(env)
-    return ["-c", f'model="{model}"', "-c", f'model_reasoning_effort="{effort}"']
+    return [
+        "-c", f'model="{model}"',
+        "-c", f'review_model="{model}"',
+        "-c", f'model_reasoning_effort="{effort}"',
+    ]
 
 
 def build_cmd(mode, *, commit=None, base=None, prompt=None, env=None):
