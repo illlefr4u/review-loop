@@ -27,8 +27,9 @@ import sys
 from pathlib import Path
 
 OUTPUT_FILE = "/tmp/codex-review.txt"
-# Решение владельца от 24.09.2026: все ревью явно запускаются на этой модели и усилии.
-REVIEW_MODEL = "gpt-6-sol"
+# Решение владельца: все ревью явно запускаются на этой модели и усилии. С 30.09.2026 — gpt-6.1-sol (замер 29.09:
+# настоящих находок столько же, покрытие другое; delegate docs/rounds/2026-09-29-codex-gpt-6.1-sol/), до того с 24.09 — gpt-6-sol.
+REVIEW_MODEL = "gpt-6.1-sol"
 REVIEW_EFFORT = "xhigh"
 # Крупные диффы (сотни строк money-кода в одном коммите) не укладываются в 900с
 # и падают «ERROR: Codex timed out» — это не вердикт, а потерянный гейт.
