@@ -1,8 +1,8 @@
-"""RED-тесты: codex-review закрепляет модель и усилие ревью (решение Al 30.09.2026: gpt-6.1-sol, xhigh;
-до него с 24.09 — gpt-6-sol, xhigh).
+"""RED-тесты: codex-review закрепляет модель и усилие ревью (решение Al 03.10.2026: gpt-6-astra, xhigh;
+30.09–03.10 — gpt-6.1-sol, с 24.09 — gpt-6-sol, оба xhigh).
 
 Контракт `~/bin/codex-review` (скрипт без расширения, грузится как модуль):
-- константы `REVIEW_MODEL == "gpt-6.1-sol"`, `REVIEW_EFFORT == "xhigh"`;
+- константы `REVIEW_MODEL == "gpt-6-astra"`, `REVIEW_EFFORT == "xhigh"`;
 - `model_args(env=None) -> list[str]` = ["-c", 'model="<m>"', "-c", 'review_model="<m>"', "-c",
   'model_reasoning_effort="<e>"'] (`codex review` читает `review_model` раньше `model`); переменные окружения
   `CODEX_REVIEW_MODEL` / `CODEX_REVIEW_EFFORT` переопределяют (пустая строка = нет переопределения);
@@ -31,16 +31,16 @@ def load():
 
 def test_pinned_constants():
     m = load()
-    assert m.REVIEW_MODEL == "gpt-6.1-sol" and m.REVIEW_EFFORT == "xhigh"
+    assert m.REVIEW_MODEL == "gpt-6-astra" and m.REVIEW_EFFORT == "xhigh"
 
 
 def test_model_args_default_and_env_override():
     m = load()
     # `codex review` берёт `review_model` раньше `model` (codex P2 на 5562737): задаём оба
-    assert m.model_args({}) == ["-c", 'model="gpt-6.1-sol"', "-c", 'review_model="gpt-6.1-sol"',
+    assert m.model_args({}) == ["-c", 'model="gpt-6-astra"', "-c", 'review_model="gpt-6-astra"',
                                 "-c", 'model_reasoning_effort="xhigh"']
-    assert m.model_args({"CODEX_REVIEW_MODEL": "gpt-6-astra", "CODEX_REVIEW_EFFORT": "high"}) == \
-        ["-c", 'model="gpt-6-astra"', "-c", 'review_model="gpt-6-astra"', "-c", 'model_reasoning_effort="high"']
+    assert m.model_args({"CODEX_REVIEW_MODEL": "gpt-6.1-sol", "CODEX_REVIEW_EFFORT": "high"}) == \
+        ["-c", 'model="gpt-6.1-sol"', "-c", 'review_model="gpt-6.1-sol"', "-c", 'model_reasoning_effort="high"']
     assert m.model_args({"CODEX_REVIEW_MODEL": "", "CODEX_REVIEW_EFFORT": ""}) == m.model_args({})
 
 
@@ -58,7 +58,7 @@ def test_print_model_exits_zero_and_touches_nothing(monkeypatch, capsys, tmp_pat
     out.write_text("previous review")
     monkeypatch.setattr(m, "OUTPUT_FILE", str(out))
     monkeypatch.setattr(sys, "argv", ["codex-review", "--print-model"])
-    monkeypatch.setenv("CODEX_REVIEW_MODEL", "gpt-6-astra")
+    monkeypatch.setenv("CODEX_REVIEW_MODEL", "gpt-6.1-sol")   # переопределение должно отличаться от дефолта
     monkeypatch.delenv("CODEX_REVIEW_EFFORT", raising=False)
     boom = lambda *a, **k: pytest.fail("--print-model must not run git or codex")   # noqa: E731
     monkeypatch.setattr(m.subprocess, "Popen", boom)
@@ -66,7 +66,7 @@ def test_print_model_exits_zero_and_touches_nothing(monkeypatch, capsys, tmp_pat
     with pytest.raises(SystemExit) as e:
         m.main()
     assert e.value.code == 0
-    assert capsys.readouterr().out.strip() == "gpt-6-astra xhigh"
+    assert capsys.readouterr().out.strip() == "gpt-6.1-sol xhigh"
     assert out.read_text() == "previous review"
 
 
@@ -97,4 +97,4 @@ def test_main_runs_build_cmd_and_announces_the_model(monkeypatch, capsys, tmp_pa
     except SystemExit as e:
         assert e.code in (0, None)
     assert FakeProc.cmd == m.build_cmd("commit", commit="abc1234", env={})
-    assert "Model: gpt-6.1-sol / xhigh" in capsys.readouterr().out
+    assert "Model: gpt-6-astra / xhigh" in capsys.readouterr().out
