@@ -13,8 +13,8 @@ Usage:
                                     # (HEAD-drift-safe in shared/multi-session repos;
                                     #  worktree is created and cleaned up automatically)
 
-Runtime: internal watchdog TIMEOUT=900s (override: CODEX_REVIEW_TIMEOUT env, seconds —
-поднимать для крупных диффов). Callers (Claude Code Bash tool) must NOT set a
+Runtime: internal watchdog TIMEOUT=900s (override: CODEX_REVIEW_TIMEOUT env, seconds;
+raise it for large diffs). Callers (Claude Code Bash tool) must NOT set a
 smaller outer timeout — run in background and wait for completion instead (a 5-min outer
 timeout killed a healthy review mid-run, real fail 2026-07-11).
 Model overrides: CODEX_REVIEW_MODEL and CODEX_REVIEW_EFFORT (empty values are ignored).
@@ -27,13 +27,13 @@ import sys
 from pathlib import Path
 
 OUTPUT_FILE = "/tmp/codex-review.txt"
-# Решение владельца: все ревью явно запускаются на этой модели и усилии. С 03.10.2026 — gpt-6-astra (Al: «для аудитов где есть
-# sol — на astra»); 30.09–03.10 — gpt-6.1-sol (замер 29.09, delegate docs/rounds/2026-09-29-codex-gpt-6.1-sol/), 24.09–30.09 — gpt-6-sol.
+# Every review runs explicitly on this model and reasoning effort, regardless of the interactive Codex config.
+# Override per run with CODEX_REVIEW_MODEL / CODEX_REVIEW_EFFORT.
 REVIEW_MODEL = "gpt-6-astra"
 REVIEW_EFFORT = "xhigh"
-# Крупные диффы (сотни строк money-кода в одном коммите) не укладываются в 900с
-# и падают «ERROR: Codex timed out» — это не вердикт, а потерянный гейт.
-# Ручка: CODEX_REVIEW_TIMEOUT=1800 codex-review --pin <sha>. Дефолт не менялся.
+# Large diffs (hundreds of changed lines in one commit) may not finish within 900s and fail with
+# "ERROR: Codex timed out". That is not a verdict but a lost review; raise the limit for such runs:
+# CODEX_REVIEW_TIMEOUT=1800 codex-review --pin <sha>
 TIMEOUT = int(os.environ.get("CODEX_REVIEW_TIMEOUT", "900"))
 
 ARCH_PROMPT = (

@@ -1,15 +1,14 @@
-"""RED-тесты: codex-review закрепляет модель и усилие ревью (решение Al 03.10.2026: gpt-6-astra, xhigh;
-30.09–03.10 — gpt-6.1-sol, с 24.09 — gpt-6-sol, оба xhigh).
+"""Tests: codex-review pins the review model and reasoning effort (gpt-6-astra, xhigh).
 
-Контракт `~/bin/codex-review` (скрипт без расширения, грузится как модуль):
-- константы `REVIEW_MODEL == "gpt-6-astra"`, `REVIEW_EFFORT == "xhigh"`;
+Contract of `codex-review` (extensionless script, loaded as a module):
+- constants `REVIEW_MODEL == "gpt-6-astra"`, `REVIEW_EFFORT == "xhigh"`;
 - `model_args(env=None) -> list[str]` = ["-c", 'model="<m>"', "-c", 'review_model="<m>"', "-c",
-  'model_reasoning_effort="<e>"'] (`codex review` читает `review_model` раньше `model`); переменные окружения
-  `CODEX_REVIEW_MODEL` / `CODEX_REVIEW_EFFORT` переопределяют (пустая строка = нет переопределения);
+  'model_reasoning_effort="<e>"'] (`codex review` reads `review_model` before `model`); the environment variables
+  `CODEX_REVIEW_MODEL` / `CODEX_REVIEW_EFFORT` override them (an empty string means no override);
 - `build_cmd(mode, *, commit=None, base=None, prompt=None, env=None)`: "commit" → codex review <model_args> --commit SHA,
-  "unpushed" → codex review <model_args> --base BASE, "arch" → codex exec <model_args> PROMPT; `main()` запускает ровно его;
-- флаг `--print-model` печатает «<модель> <усилие>» и выходит с кодом 0, ничего не трогая (ни git, ни файл вывода);
-- перед запуском ревью печатается строка `Model: <модель> / <усилие>`.
+  "unpushed" → codex review <model_args> --base BASE, "arch" → codex exec <model_args> PROMPT; `main()` runs exactly that command;
+- `--print-model` prints "<model> <effort>" and exits with code 0 without touching anything (no git, no output file);
+- before a review starts, the line `Model: <model> / <effort>` is printed.
 """
 import importlib.machinery
 import importlib.util
@@ -36,7 +35,7 @@ def test_pinned_constants():
 
 def test_model_args_default_and_env_override():
     m = load()
-    # `codex review` берёт `review_model` раньше `model` (codex P2 на 5562737): задаём оба
+    # `codex review` reads `review_model` before `model`, so both are set
     assert m.model_args({}) == ["-c", 'model="gpt-6-astra"', "-c", 'review_model="gpt-6-astra"',
                                 "-c", 'model_reasoning_effort="xhigh"']
     assert m.model_args({"CODEX_REVIEW_MODEL": "gpt-6.1-sol", "CODEX_REVIEW_EFFORT": "high"}) == \
@@ -58,7 +57,7 @@ def test_print_model_exits_zero_and_touches_nothing(monkeypatch, capsys, tmp_pat
     out.write_text("previous review")
     monkeypatch.setattr(m, "OUTPUT_FILE", str(out))
     monkeypatch.setattr(sys, "argv", ["codex-review", "--print-model"])
-    monkeypatch.setenv("CODEX_REVIEW_MODEL", "gpt-6.1-sol")   # переопределение должно отличаться от дефолта
+    monkeypatch.setenv("CODEX_REVIEW_MODEL", "gpt-6.1-sol")   # the override must differ from the default
     monkeypatch.delenv("CODEX_REVIEW_EFFORT", raising=False)
     boom = lambda *a, **k: pytest.fail("--print-model must not run git or codex")   # noqa: E731
     monkeypatch.setattr(m.subprocess, "Popen", boom)
