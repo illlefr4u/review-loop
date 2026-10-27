@@ -29,7 +29,7 @@ from pathlib import Path
 OUTPUT_FILE = "/tmp/codex-review.txt"
 # Every review runs explicitly on this model and reasoning effort, regardless of the interactive Codex config.
 # Override per run with CODEX_REVIEW_MODEL / CODEX_REVIEW_EFFORT.
-REVIEW_MODEL = "gpt-6-astra"
+REVIEW_MODEL = "gpt-6.1-terra"
 REVIEW_EFFORT = "xhigh"
 # Large diffs (hundreds of changed lines in one commit) may not finish within 900s and fail with
 # "ERROR: Codex timed out". That is not a verdict but a lost review; raise the limit for such runs:
