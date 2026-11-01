@@ -22,6 +22,7 @@ Model overrides: CODEX_REVIEW_MODEL and CODEX_REVIEW_EFFORT (empty values are ig
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -30,7 +31,7 @@ OUTPUT_FILE = "/tmp/codex-review.txt"
 # Every review runs explicitly on this model and reasoning effort, regardless of the interactive Codex config.
 # Override per run with CODEX_REVIEW_MODEL / CODEX_REVIEW_EFFORT.
 REVIEW_MODEL = "gpt-6.1-terra"
-REVIEW_EFFORT = "xhigh"
+REVIEW_EFFORT = "max"
 # Large diffs (hundreds of changed lines in one commit) may not finish within 900s and fail with
 # "ERROR: Codex timed out". That is not a verdict but a lost review; raise the limit for such runs:
 # CODEX_REVIEW_TIMEOUT=1800 codex-review --pin <sha>
@@ -66,6 +67,18 @@ def model_args(env=None):
         "-c", f'review_model="{model}"',
         "-c", f'model_reasoning_effort="{effort}"',
     ]
+
+
+def failure_summary(stderr_text, limit=1500):
+    """Error lines plus the tail of Codex stderr: the cause is printed last, after the banner."""
+    text = (stderr_text or "").strip()
+    if not text:
+        return ""
+    marked = [line for line in text.splitlines()
+              if re.search(r"\bERROR\b|error:|flagged|cyber_policy|usage limit|rate limit|quota", line, re.I)]
+    tail = text if len(text) <= limit else "..." + text[-limit:]
+    parts = (["\n".join(marked[-5:])] if marked else []) + [tail]
+    return "\n---\n".join(parts)[:2000]
 
 
 def build_cmd(mode, *, commit=None, base=None, prompt=None, env=None):
@@ -250,7 +263,7 @@ def main():
     if proc.returncode != 0:
         stderr_msg = "".join(stderr_chunks).strip()
         if stderr_msg:
-            print(f"\nCodex failed (exit {proc.returncode}): {stderr_msg[:500]}", file=sys.stderr)
+            print(f"\nCodex failed (exit {proc.returncode}): {failure_summary(stderr_msg)}", file=sys.stderr)
         if not has_output:
             sys.exit(1)
 

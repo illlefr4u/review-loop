@@ -1,7 +1,7 @@
-"""Tests: codex-review pins the review model and reasoning effort (gpt-6.1-terra, xhigh).
+"""Tests: codex-review pins the review model and reasoning effort (gpt-6.1-terra, max).
 
 Contract of `codex-review` (extensionless script, loaded as a module):
-- constants `REVIEW_MODEL == "gpt-6.1-terra"`, `REVIEW_EFFORT == "xhigh"`;
+- constants `REVIEW_MODEL == "gpt-6.1-terra"`, `REVIEW_EFFORT == "max"`;
 - `model_args(env=None) -> list[str]` = ["-c", 'model="<m>"', "-c", 'review_model="<m>"', "-c",
   'model_reasoning_effort="<e>"'] (`codex review` reads `review_model` before `model`); the environment variables
   `CODEX_REVIEW_MODEL` / `CODEX_REVIEW_EFFORT` override them (an empty string means no override);
@@ -30,14 +30,14 @@ def load():
 
 def test_pinned_constants():
     m = load()
-    assert m.REVIEW_MODEL == "gpt-6.1-terra" and m.REVIEW_EFFORT == "xhigh"
+    assert m.REVIEW_MODEL == "gpt-6.1-terra" and m.REVIEW_EFFORT == "max"
 
 
 def test_model_args_default_and_env_override():
     m = load()
     # `codex review` reads `review_model` before `model`, so both are set
     assert m.model_args({}) == ["-c", 'model="gpt-6.1-terra"', "-c", 'review_model="gpt-6.1-terra"',
-                                "-c", 'model_reasoning_effort="xhigh"']
+                                "-c", 'model_reasoning_effort="max"']
     assert m.model_args({"CODEX_REVIEW_MODEL": "gpt-6.1-sol", "CODEX_REVIEW_EFFORT": "high"}) == \
         ["-c", 'model="gpt-6.1-sol"', "-c", 'review_model="gpt-6.1-sol"', "-c", 'model_reasoning_effort="high"']
     assert m.model_args({"CODEX_REVIEW_MODEL": "", "CODEX_REVIEW_EFFORT": ""}) == m.model_args({})
@@ -65,7 +65,7 @@ def test_print_model_exits_zero_and_touches_nothing(monkeypatch, capsys, tmp_pat
     with pytest.raises(SystemExit) as e:
         m.main()
     assert e.value.code == 0
-    assert capsys.readouterr().out.strip() == "gpt-6.1-sol xhigh"
+    assert capsys.readouterr().out.strip() == "gpt-6.1-sol max"
     assert out.read_text() == "previous review"
 
 
@@ -96,4 +96,17 @@ def test_main_runs_build_cmd_and_announces_the_model(monkeypatch, capsys, tmp_pa
     except SystemExit as e:
         assert e.code in (0, None)
     assert FakeProc.cmd == m.build_cmd("commit", commit="abc1234", env={})
-    assert "Model: gpt-6.1-terra / xhigh" in capsys.readouterr().out
+    assert "Model: gpt-6.1-terra / max" in capsys.readouterr().out
+
+
+# --- failure reporting ---
+# The failure report must carry the error, which Codex prints at the end of stderr after its banner.
+
+def test_failure_report_shows_the_error_at_the_end_of_stderr():
+    m = load()
+    banner = "OpenAI Codex v0.166.0\n--------\n" + ("workdir: /tmp/x\n" * 60)
+    err = banner + "ERROR: This content was flagged for possible cybersecurity risk. (cyber_policy)\n"
+    summary = m.failure_summary(err)
+    assert "flagged for possible cybersecurity risk" in summary
+    assert len(summary) <= 2000
+    assert m.failure_summary("") == ""
