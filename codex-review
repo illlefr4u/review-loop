@@ -21,10 +21,12 @@ Model overrides: CODEX_REVIEW_MODEL and CODEX_REVIEW_EFFORT (empty values are ig
 """
 
 import argparse
+import json
 import os
 import re
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 OUTPUT_FILE = "/tmp/codex-review.txt"
@@ -138,10 +140,21 @@ def git_changed_files(commit="HEAD"):
         return []
 
 
+def pinned_worktree_matches(pin_sha):
+    """Check that the detached worktree is clean and still at the pin."""
+    try:
+        head = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+        return head == pin_sha and not subprocess.check_output(
+            ["git", "status", "--porcelain", "--untracked-files=all"]
+        )
+    except subprocess.CalledProcessError:
+        return False
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run Codex review")
     parser.add_argument("--arch", action="store_true", help="Architecture review mode")
-    parser.add_argument("--commit", default="HEAD", help="Commit to review (default: HEAD)")
+    parser.add_argument("--commit", help="Commit to review (default: HEAD)")
     parser.add_argument("--unpushed", action="store_true", help="Review all unpushed commits vs origin")
     parser.add_argument("--print-model", action="store_true",
                         help="Print the configured review model and effort, then exit")
@@ -156,37 +169,124 @@ def main():
         print(f"{model} {effort}")
         sys.exit(0)
 
+    record = {"reason": "review did not complete"} if args.pin and not args.arch else None
+    try:
+        run_review(args, record)
+    except Exception as e:
+        if record is not None:
+            record["reason"] = str(e)
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
+    finally:
+        if record is not None:
+            reason = ("the pinned worktree does not match the pin" if record.get("pin_mismatch")
+                      else record["reason"])
+            if reason is None:
+                try:
+                    entry = {
+                        "sha": record["sha"],
+                        "mode": "unpushed" if args.unpushed else "commit",
+                        "repo": record["repo"],
+                        "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "completed": True,
+                    }
+                    if args.unpushed:
+                        entry["base"] = record["base"]
+                    record["path"].parent.mkdir(parents=True, exist_ok=True)
+                    with record["path"].open("a") as verdicts:
+                        verdicts.write(json.dumps(entry) + "\n")
+                except Exception as e:
+                    reason = f"cannot append review record: {e}"
+            if reason is not None:
+                print("WARNING: review record not written: " + " ".join(reason.splitlines()),
+                      file=sys.stderr)
+
+
+def run_review(args, record):
+    """Run the review, marking completion only after successful output consumption."""
+    start_dir = Path.cwd()
+    if record is not None:
+        verdict_path = Path(os.environ.get(
+            "CODEX_REVIEW_VERDICTS", "~/.local/state/codex-review/verdicts.jsonl"
+        )).expanduser()
+        record["path"] = start_dir / verdict_path
+
     # Clean previous output
     if os.path.exists(OUTPUT_FILE):
         os.remove(OUTPUT_FILE)
 
     # --pin: create a detached worktree at SHA and run the whole review from inside it.
     # Cleanup is registered via atexit so every exit path (timeout, codex failure, Ctrl-C)
-    # removes the worktree; `git worktree remove` is invoked with an explicit -C <origrepo>
-    # so it works regardless of the cwd at exit time.
+    # removes the worktree from the original directory with the source Git environment.
+    pin_mismatch = False
     if args.pin:
         import atexit
         import tempfile
-        orig_repo = os.getcwd()
+        os.environ["GIT_NO_REPLACE_OBJECTS"] = "1"
+        orig_repo = subprocess.check_output(
+            ["git", "rev-parse", "--show-toplevel"], text=True
+        ).strip()
+        pin_sha = subprocess.check_output(
+            ["git", "rev-parse", "--verify", "--end-of-options", f"{args.pin}^{{commit}}"],
+            text=True
+        ).strip()
+        # Resolve all refs in the source checkout before detaching or moving HEAD.
+        if args.commit is None:
+            args.commit = pin_sha
+        else:
+            args.commit = subprocess.check_output(
+                ["git", "rev-parse", "--verify", "--end-of-options", f"{args.commit}^{{commit}}"],
+                text=True
+            ).strip()
+        if record is not None:
+            record.update(sha=pin_sha, repo=orig_repo)
+            if args.commit != pin_sha:
+                record["reason"] = "--commit resolves to a different commit than --pin"
+        if args.unpushed and not args.arch:
+            try:
+                base = subprocess.check_output(
+                    ["git", "rev-parse", "--verify", "--quiet", "--end-of-options",
+                     f"{git_unpushed_base()}^{{commit}}"], text=True
+                ).strip()
+            except subprocess.CalledProcessError:
+                base = subprocess.check_output(
+                    ["git", "rev-parse", "--verify", "origin/HEAD^{commit}"], text=True
+                ).strip()
+            if record is not None:
+                # Codex starts the diff at the common ancestor with the pin.
+                record["base"] = subprocess.check_output(
+                    ["git", "merge-base", base, pin_sha], text=True
+                ).strip()
         tmpdir = tempfile.mkdtemp(prefix="codex-pin-")
         try:
             subprocess.check_output(
-                ["git", "-C", orig_repo, "worktree", "add", "--detach", tmpdir, args.pin],
+                ["git", "-c", "core.hooksPath=/dev/null",
+                 "worktree", "add", "--detach", tmpdir, pin_sha],
                 stderr=subprocess.STDOUT, text=True)
         except subprocess.CalledProcessError as e:
             print(f"ERROR: cannot pin worktree at {args.pin}: {e.output.strip()[:300]}",
                   file=sys.stderr)
             sys.exit(1)
 
+        source_env = os.environ.copy()
+
         def _cleanup_pin():
-            subprocess.run(["git", "-C", orig_repo, "worktree", "remove", "--force", tmpdir],
+            subprocess.run(["git", "worktree", "remove", "--force", tmpdir],
+                           cwd=start_dir, env=source_env,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
         atexit.register(_cleanup_pin)
         os.chdir(tmpdir)
-        if args.commit == "HEAD":         # default -> review the pinned commit itself
-            args.commit = args.pin
-        print(f"Pinned worktree at {args.pin[:12]} ({tmpdir})")
+        for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR",
+                     "GIT_OBJECT_DIRECTORY"):
+            os.environ.pop(name, None)
+        if record is not None:
+            pin_mismatch = not pinned_worktree_matches(pin_sha)
+            record["pin_mismatch"] = pin_mismatch
+        print(f"Pinned worktree at {pin_sha[:12]} ({tmpdir})")
+
+    if args.commit is None:
+        args.commit = "HEAD"
 
     if args.arch:
         changed = git_changed_files(args.commit)
@@ -196,9 +296,12 @@ def main():
         cmd = build_cmd("arch", prompt=prompt)
         print(f"Running architecture review ({len(changed)} files)...")
     elif args.unpushed:
-        base = git_unpushed_base()
+        if not args.pin:
+            base = git_unpushed_base()
         count = git_unpushed_count(base)
-        if count == 0:
+        if count == 0 and not pin_mismatch:
+            if record is not None:
+                record["reason"] = "no unpushed commits to review"
             print(f"No unpushed commits vs {base}")
             sys.exit(0)
         cmd = build_cmd("unpushed", base=base)
@@ -215,30 +318,43 @@ def main():
     # capture_output=True buffers everything — on large codebases with gpt-5.4/xhigh
     # this means 7-10 min of silence before any output, making it look hung.
     import threading
-    import time
 
     stdout_lines = []
     stderr_chunks = []
+    stdout_complete = threading.Event()
+    read_errors = []
 
     try:
         with open(OUTPUT_FILE, "w") as outf:
             proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                env=os.environ.copy(),
             )
 
             # Read stdout in worker thread (blocks on readline)
             def read_stdout():
-                for line in proc.stdout:
-                    sys.stdout.write(line)
-                    sys.stdout.flush()
-                    outf.write(line)
-                    outf.flush()
-                    stdout_lines.append(line)
+                try:
+                    for line in proc.stdout:
+                        sys.stdout.write(line)
+                        sys.stdout.flush()
+                        outf.write(line)
+                        outf.flush()
+                        stdout_lines.append(line)
+                    stdout_complete.set()
+                except Exception as e:
+                    if record is None:
+                        raise
+                    read_errors.append(e)
 
             # Drain stderr in background thread to prevent pipe buffer deadlock
             def drain_stderr():
-                for line in proc.stderr:
-                    stderr_chunks.append(line)
+                try:
+                    for line in proc.stderr:
+                        stderr_chunks.append(line)
+                except Exception as e:
+                    if record is None:
+                        raise
+                    read_errors.append(e)
 
             t_out = threading.Thread(target=read_stdout, daemon=True)
             t_err = threading.Thread(target=drain_stderr, daemon=True)
@@ -248,20 +364,37 @@ def main():
             # Main thread = watchdog
             t_out.join(timeout=TIMEOUT)
             if t_out.is_alive():
+                if record is not None:
+                    record["reason"] = f"Codex timed out after {TIMEOUT}s"
                 proc.kill()
                 proc.wait()
                 print(f"\nERROR: Codex timed out after {TIMEOUT}s", file=sys.stderr)
                 sys.exit(1)
 
+            if record is not None and not stdout_complete.is_set():
+                # A failed reader cannot drain the pipe while Codex is still writing.
+                proc.kill()
             proc.wait()
+            # A descendant may keep stderr open after Codex has exited.
             t_err.join(timeout=5)
     except Exception as e:
+        if record is not None:
+            record["reason"] = str(e)
         print(f"ERROR: {e}", file=sys.stderr)
         sys.exit(1)
 
     has_output = bool(stdout_lines)
 
+    if record is not None and (read_errors or not stdout_complete.is_set()):
+        reason = (f"error reading Codex output: {read_errors[0]}" if read_errors
+                  else "Codex output was not read to the end")
+        record["reason"] = reason
+        print(f"ERROR: {reason}", file=sys.stderr)
+        sys.exit(1)
+
     if proc.returncode != 0:
+        if record is not None:
+            record["reason"] = f"Codex exited with code {proc.returncode}"
         stderr_msg = "".join(stderr_chunks).strip()
         if stderr_msg:
             print(f"\nCodex failed (exit {proc.returncode}): {failure_summary(stderr_msg)}", file=sys.stderr)
@@ -269,8 +402,16 @@ def main():
             sys.exit(1)
 
     if not has_output:
+        if record is not None:
+            record["reason"] = "Codex output is empty"
         print("No output from Codex", file=sys.stderr)
         sys.exit(1)
+
+    if record is not None and proc.returncode == 0 and record["reason"] == "review did not complete":
+        if not pinned_worktree_matches(pin_sha):
+            record["pin_mismatch"] = True
+        elif not record["pin_mismatch"]:
+            record["reason"] = None if any(line.strip() for line in stdout_lines) else "Codex output is empty"
 
 
 if __name__ == "__main__":
