@@ -2,6 +2,8 @@
 
 Contract of `codex-review` (extensionless script, loaded as a module):
 - constants `REVIEW_MODEL == "gpt-6.1-terra"`, `REVIEW_EFFORT == "max"`;
+- watchdog `TIMEOUT` defaults to 2400 s (max-effort reviews took up to 1326 s on small commits), the
+  `CODEX_REVIEW_TIMEOUT` environment variable overrides it;
 - `model_args(env=None) -> list[str]` = ["-c", 'model="<m>"', "-c", 'review_model="<m>"', "-c",
   'model_reasoning_effort="<e>"'] (`codex review` reads `review_model` before `model`); the environment variables
   `CODEX_REVIEW_MODEL` / `CODEX_REVIEW_EFFORT` override them (an empty string means no override);
@@ -31,6 +33,13 @@ def load():
 def test_pinned_constants():
     m = load()
     assert m.REVIEW_MODEL == "gpt-6.1-terra" and m.REVIEW_EFFORT == "max"
+
+
+def test_timeout_default_and_env_override(monkeypatch):
+    monkeypatch.delenv("CODEX_REVIEW_TIMEOUT", raising=False)
+    assert load().TIMEOUT == 2400
+    monkeypatch.setenv("CODEX_REVIEW_TIMEOUT", "3600")
+    assert load().TIMEOUT == 3600
 
 
 def test_model_args_default_and_env_override():

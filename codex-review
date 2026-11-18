@@ -13,7 +13,7 @@ Usage:
                                     # (HEAD-drift-safe in shared/multi-session repos;
                                     #  worktree is created and cleaned up automatically)
 
-Runtime: internal watchdog TIMEOUT=900s (override: CODEX_REVIEW_TIMEOUT env, seconds;
+Runtime: internal watchdog TIMEOUT=2400s (override: CODEX_REVIEW_TIMEOUT env, seconds;
 raise it for large diffs). Callers (Claude Code Bash tool) must NOT set a
 smaller outer timeout — run in background and wait for completion instead (a 5-min outer
 timeout killed a healthy review mid-run, real fail 2026-07-11).
@@ -32,10 +32,11 @@ OUTPUT_FILE = "/tmp/codex-review.txt"
 # Override per run with CODEX_REVIEW_MODEL / CODEX_REVIEW_EFFORT.
 REVIEW_MODEL = "gpt-6.1-terra"
 REVIEW_EFFORT = "max"
-# Large diffs (hundreds of changed lines in one commit) may not finish within 900s and fail with
+# Max-effort reviews took up to 1326s on small commits under parallel load, so the default limit is 2400s.
+# Large diffs (hundreds of changed lines in one commit) may still not finish and fail with
 # "ERROR: Codex timed out". That is not a verdict but a lost review; raise the limit for such runs:
-# CODEX_REVIEW_TIMEOUT=1800 codex-review --pin <sha>
-TIMEOUT = int(os.environ.get("CODEX_REVIEW_TIMEOUT", "900"))
+# CODEX_REVIEW_TIMEOUT=3600 codex-review --pin <sha>
+TIMEOUT = int(os.environ.get("CODEX_REVIEW_TIMEOUT", "2400"))
 
 ARCH_PROMPT = (
     "Review the provided architecture plan. Output ONLY architecture-level findings "
