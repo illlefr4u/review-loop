@@ -18,22 +18,34 @@ raise it for large diffs). Callers (Claude Code Bash tool) must NOT set a
 smaller outer timeout — run in background and wait for completion instead (a 5-min outer
 timeout killed a healthy review mid-run, real fail 2026-07-11).
 Model overrides: CODEX_REVIEW_MODEL and CODEX_REVIEW_EFFORT (empty values are ignored).
+The wrapper reports cyber_policy refusals and prints a manual Daybreak Blue
+command for commit and architecture reviews. It never runs Daybreak itself.
+CODEX_REVIEW_DAYBREAK_MODEL and CODEX_REVIEW_DAYBREAK_EFFORT configure the printed command.
 """
 
 import argparse
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 OUTPUT_FILE = "/tmp/codex-review.txt"
-# Every review runs explicitly on this model and reasoning effort, regardless of the interactive Codex config.
+# The review runs explicitly on this model and reasoning effort, regardless of the interactive Codex config.
 # Override per run with CODEX_REVIEW_MODEL / CODEX_REVIEW_EFFORT.
 REVIEW_MODEL = "gpt-6.1-terra"
 REVIEW_EFFORT = "max"
+# Defaults for the manual Daybreak Blue command.
+DAYBREAK_MODEL = "gpt-6-sol"
+DAYBREAK_PROGRAM = "daybreak_blue"
+DAYBREAK_EFFORT = "max"
+DAYBREAK_GIT_ENV_PREFIX = (
+    "env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_COMMON_DIR "
+    "-u GIT_OBJECT_DIRECTORY GIT_NO_REPLACE_OBJECTS=1 "
+)
 # Max-effort reviews took up to 1326s on small commits under parallel load, so the default limit is 2400s.
 # Large diffs (hundreds of changed lines in one commit) may still not finish and fail with
 # "ERROR: Codex timed out". That is not a verdict but a lost review; raise the limit for such runs:
@@ -64,7 +76,19 @@ def _model_config(env=None):
 
 def model_args(env=None):
     """Build explicit Codex configuration arguments for review runs."""
-    model, effort = _model_config(env)
+    return _model_args(*_model_config(env))
+
+
+def daybreak_model_args(env=None):
+    """Build Codex configuration arguments for the manual Daybreak command."""
+    if env is None:
+        env = os.environ
+    model = env.get("CODEX_REVIEW_DAYBREAK_MODEL") or DAYBREAK_MODEL
+    effort = env.get("CODEX_REVIEW_DAYBREAK_EFFORT") or DAYBREAK_EFFORT
+    return _model_args(model, effort)
+
+
+def _model_args(model, effort):
     return [
         "-c", f'model="{model}"',
         "-c", f'review_model="{model}"',
@@ -84,9 +108,124 @@ def failure_summary(stderr_text, limit=1500):
     return "\n---\n".join(parts)[:2000]
 
 
+def _session_id(stderr_text):
+    """Read the first session ID reported by Codex, ignoring ANSI codes."""
+    text = re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]", "", stderr_text or "")
+    session = re.search(r"(?m)^[ \t]*session id:[ \t]+(\S+)[ \t]*\r?$", text)
+    return session[1] if session else None
+
+
+def _session_rollout_paths(stderr_text, codex_home=None):
+    """Find rollout paths for the first session ID reported by Codex."""
+    session_id = _session_id(stderr_text)
+    if session_id is None:
+        return
+
+    home = Path(codex_home or os.environ.get("CODEX_HOME") or "~/.codex").expanduser()
+    suffix = f"{session_id}.jsonl"
+    for path in (home / "sessions").rglob("rollout-*.jsonl"):
+        if path.name.endswith(suffix):
+            yield path
+
+
+def _session_rollout_lines(stderr_text, codex_home=None):
+    for path in _session_rollout_paths(stderr_text, codex_home):
+        try:
+            if path.is_file():
+                with path.open(encoding="utf-8", errors="replace") as rollout:
+                    yield from rollout
+        except OSError:
+            continue
+
+
+def is_cyber_policy_refusal(returncode, stderr_text, codex_home=None) -> bool:
+    """Identify a failed review whose session journal records a cyber policy refusal."""
+    if not returncode:
+        return False
+    for line in _session_rollout_lines(stderr_text, codex_home):
+        try:
+            event = json.loads(line)
+        except (ValueError, RecursionError):
+            continue
+        if not isinstance(event, dict) or event.get("type") != "event_msg":
+            continue
+        payload = event.get("payload")
+        if not isinstance(payload, dict) or payload.get("type") != "task_complete":
+            continue
+        error = payload.get("error")
+        if isinstance(error, dict) and error.get("codex_error_info") == "cyber_policy":
+            return True
+    return False
+
+
+def report_codex_failure(returncode, stderr_text):
+    summary = failure_summary(stderr_text)
+    detail = f": {summary}" if summary else ""
+    print(f"\nCodex failed (exit {returncode}){detail}", file=sys.stderr)
+
+
+def daybreak_review_prompt(commit) -> str:
+    """Build a code review prompt for the exact commit."""
+    if commit is None:
+        raise ValueError("the Daybreak review needs a commit")
+    return (
+        "Review only the commit shown by `git show -m --first-parent "
+        f"--end-of-options {shlex.quote(commit)} --`. "
+        "Do not modify any files; report findings only. "
+        "Report only actionable defects introduced by this change, in descending severity. "
+        "Use one of [P0], [P1], [P2], or [P3] for each finding. "
+        "Start each finding with a line in the form `- [P0|P1|P2|P3] <title> — <path>:<line>`. "
+        "Follow that line with a paragraph describing a concrete scenario where the defect causes a failure. "
+        "If there are no defects, explicitly say so."
+    )
+
+
+def daybreak_command(mode, *, commit=None, prompt=None, env=None):
+    """Build the Daybreak Blue command to print for a manual review."""
+    if mode == "commit":
+        prompt = daybreak_review_prompt(commit)
+    elif mode != "arch":
+        raise ValueError(f"unsupported Daybreak review mode: {mode}")
+    return [
+        "codex", "exec", *daybreak_model_args(env), "--cyber-access-program",
+        DAYBREAK_PROGRAM, "-s", "read-only", prompt,
+    ]
+
+
+def report_cyber_policy_refusal(stderr_text, mode, target, *, pin_sha=None):
+    session_id = _session_id(stderr_text)
+    print(f"Review stopped by OpenAI's cyber_policy filter (session id: {session_id}).", file=sys.stderr)
+    if mode == "unpushed":
+        return
+
+    command = DAYBREAK_GIT_ENV_PREFIX + shlex.join(daybreak_command(mode, **target))
+    worktree_sha = target["commit"] if mode == "commit" else pin_sha
+    if worktree_sha is not None:
+        print(
+            "From the original checkout, create a fresh detached worktree. Replace <dir> with a new path.\n"
+            f"  {DAYBREAK_GIT_ENV_PREFIX}git -c core.hooksPath=/dev/null worktree add --detach "
+            f"<dir> {shlex.quote(worktree_sha)}\n"
+            "Check that the worktree is clean. This command should produce no output.\n"
+            f"  {DAYBREAK_GIT_ENV_PREFIX}git -C <dir> status --porcelain\n"
+            "Run the following Daybreak Blue command from inside that worktree.\n"
+            f"{command}\n"
+            "After the review, return to the original checkout and remove the worktree.\n"
+            f"  {DAYBREAK_GIT_ENV_PREFIX}git worktree remove <dir>",
+            file=sys.stderr,
+        )
+    else:
+        print(f"Run the following Daybreak Blue command manually.\n{command}", file=sys.stderr)
+    print(
+        "WARNING — OpenAI may use the Daybreak session for training.\n"
+        "WARNING — The Daybreak agent can read any file on this machine and call any MCP tool configured for Codex.\n"
+        "WARNING — The manual review does not count toward the deploy gate.",
+        file=sys.stderr,
+    )
+
+
 def build_cmd(mode, *, commit=None, base=None, prompt=None, env=None):
     """Build a Codex command for one of the supported review modes."""
-    args = model_args(env)
+    args = [*model_args(env), "-c", "daybreak=false"]
     if mode == "commit":
         return ["codex", "review", *args, "--commit", commit]
     if mode == "unpushed":
@@ -94,6 +233,12 @@ def build_cmd(mode, *, commit=None, base=None, prompt=None, env=None):
     if mode == "arch":
         return ["codex", "exec", *args, prompt]
     raise ValueError(f"unknown review mode: {mode}")
+
+
+def git_resolve_commit(ref, *, quiet=False):
+    """Resolve a commit ref to its full object ID."""
+    cmd = ["git", "rev-parse", "--verify", "--end-of-options", f"{ref}^{{commit}}"]
+    return subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL if quiet else None).strip()
 
 
 def git_unpushed_base():
@@ -218,6 +363,7 @@ def run_review(args, record):
     # --pin: create a detached worktree at SHA and run the whole review from inside it.
     # Cleanup is registered via atexit so every exit path (timeout, codex failure, Ctrl-C)
     # removes the worktree from the original directory with the source Git environment.
+    pin_sha = None
     pin_mismatch = False
     if args.pin:
         import atexit
@@ -226,32 +372,21 @@ def run_review(args, record):
         orig_repo = subprocess.check_output(
             ["git", "rev-parse", "--show-toplevel"], text=True
         ).strip()
-        pin_sha = subprocess.check_output(
-            ["git", "rev-parse", "--verify", "--end-of-options", f"{args.pin}^{{commit}}"],
-            text=True
-        ).strip()
+        pin_sha = git_resolve_commit(args.pin)
         # Resolve all refs in the source checkout before detaching or moving HEAD.
         if args.commit is None:
             args.commit = pin_sha
         else:
-            args.commit = subprocess.check_output(
-                ["git", "rev-parse", "--verify", "--end-of-options", f"{args.commit}^{{commit}}"],
-                text=True
-            ).strip()
+            args.commit = git_resolve_commit(args.commit)
         if record is not None:
             record.update(sha=pin_sha, repo=orig_repo)
             if args.commit != pin_sha:
                 record["reason"] = "--commit resolves to a different commit than --pin"
         if args.unpushed and not args.arch:
             try:
-                base = subprocess.check_output(
-                    ["git", "rev-parse", "--verify", "--quiet", "--end-of-options",
-                     f"{git_unpushed_base()}^{{commit}}"], text=True
-                ).strip()
+                base = git_resolve_commit(git_unpushed_base(), quiet=True)
             except subprocess.CalledProcessError:
-                base = subprocess.check_output(
-                    ["git", "rev-parse", "--verify", "origin/HEAD^{commit}"], text=True
-                ).strip()
+                base = git_resolve_commit("origin/HEAD")
             if record is not None:
                 # Codex starts the diff at the common ancestor with the pin.
                 record["base"] = subprocess.check_output(
@@ -293,7 +428,7 @@ def run_review(args, record):
         prompt = ARCH_PROMPT
         if changed:
             prompt = f"Focus on these files from the last commit: {', '.join(changed)}. {prompt}"
-        cmd = build_cmd("arch", prompt=prompt)
+        mode, target = "arch", {"prompt": prompt}
         print(f"Running architecture review ({len(changed)} files)...")
     elif args.unpushed:
         if not args.pin:
@@ -304,15 +439,48 @@ def run_review(args, record):
                 record["reason"] = "no unpushed commits to review"
             print(f"No unpushed commits vs {base}")
             sys.exit(0)
-        cmd = build_cmd("unpushed", base=base)
+        mode, target = "unpushed", {"base": base}
         print(f"Running code review on {count} unpushed commits vs {base}...")
     else:
+        if not args.pin:
+            try:
+                args.commit = git_resolve_commit(args.commit, quiet=True)
+            except subprocess.CalledProcessError:
+                pass
         changed = git_changed_files(args.commit)
-        cmd = build_cmd("commit", commit=args.commit)
+        mode, target = "commit", {"commit": args.commit}
         print(f"Running code review on {args.commit[:8]} ({len(changed)} files)...")
 
     model, effort = _model_config()
-    print(f"Model: {model} / {effort}")
+    print(f"Model: {model} / {effort}", flush=True)
+    returncode, stdout_lines, stderr_text = run_codex(build_cmd(mode, **target), record)
+
+    if returncode != 0:
+        if record is not None:
+            record["reason"] = f"Codex exited with code {returncode}"
+        if is_cyber_policy_refusal(returncode, stderr_text):
+            report_cyber_policy_refusal(stderr_text, mode, target, pin_sha=pin_sha)
+            sys.exit(1)
+        if stderr_text:
+            report_codex_failure(returncode, stderr_text)
+        if not stdout_lines:
+            sys.exit(1)
+
+    if not stdout_lines:
+        if record is not None:
+            record["reason"] = "Codex output is empty"
+        print("No output from Codex", file=sys.stderr)
+        sys.exit(1)
+
+    if record is not None and returncode == 0 and record["reason"] == "review did not complete":
+        if not pinned_worktree_matches(pin_sha):
+            record["pin_mismatch"] = True
+        elif not record["pin_mismatch"]:
+            record["reason"] = None if any(line.strip() for line in stdout_lines) else "Codex output is empty"
+
+
+def run_codex(cmd, record):
+    """Stream one Codex command and return its exit code, stdout lines and stderr."""
 
     # Stream output in real-time while capturing to file.
     # capture_output=True buffers everything — on large codebases with gpt-5.4/xhigh
@@ -383,8 +551,6 @@ def run_review(args, record):
         print(f"ERROR: {e}", file=sys.stderr)
         sys.exit(1)
 
-    has_output = bool(stdout_lines)
-
     if record is not None and (read_errors or not stdout_complete.is_set()):
         reason = (f"error reading Codex output: {read_errors[0]}" if read_errors
                   else "Codex output was not read to the end")
@@ -392,26 +558,7 @@ def run_review(args, record):
         print(f"ERROR: {reason}", file=sys.stderr)
         sys.exit(1)
 
-    if proc.returncode != 0:
-        if record is not None:
-            record["reason"] = f"Codex exited with code {proc.returncode}"
-        stderr_msg = "".join(stderr_chunks).strip()
-        if stderr_msg:
-            print(f"\nCodex failed (exit {proc.returncode}): {failure_summary(stderr_msg)}", file=sys.stderr)
-        if not has_output:
-            sys.exit(1)
-
-    if not has_output:
-        if record is not None:
-            record["reason"] = "Codex output is empty"
-        print("No output from Codex", file=sys.stderr)
-        sys.exit(1)
-
-    if record is not None and proc.returncode == 0 and record["reason"] == "review did not complete":
-        if not pinned_worktree_matches(pin_sha):
-            record["pin_mismatch"] = True
-        elif not record["pin_mismatch"]:
-            record["reason"] = None if any(line.strip() for line in stdout_lines) else "Codex output is empty"
+    return proc.returncode, stdout_lines, "".join(stderr_chunks).strip()
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@ Contract of `codex-review` (extensionless script, loaded as a module):
 """
 import importlib.machinery
 import importlib.util
+import subprocess
 import sys
 from pathlib import Path
 
@@ -55,9 +56,10 @@ def test_model_args_default_and_env_override():
 def test_build_cmd_all_modes_carry_the_model():
     m = load()
     ma = m.model_args({})
-    assert m.build_cmd("commit", commit="abc1234", env={}) == ["codex", "review", *ma, "--commit", "abc1234"]
-    assert m.build_cmd("unpushed", base="origin/main", env={}) == ["codex", "review", *ma, "--base", "origin/main"]
-    assert m.build_cmd("arch", prompt="P", env={}) == ["codex", "exec", *ma, "P"]
+    off = ["-c", "daybreak=false"]   # a normal run never uses Daybreak, whatever the saved Codex configuration says
+    assert m.build_cmd("commit", commit="abc1234", env={}) == ["codex", "review", *ma, *off, "--commit", "abc1234"]
+    assert m.build_cmd("unpushed", base="origin/main", env={}) == ["codex", "review", *ma, *off, "--base", "origin/main"]
+    assert m.build_cmd("arch", prompt="P", env={}) == ["codex", "exec", *ma, *off, "P"]
 
 
 def test_print_model_exits_zero_and_touches_nothing(monkeypatch, capsys, tmp_path):
@@ -96,7 +98,10 @@ def test_main_runs_build_cmd_and_announces_the_model(monkeypatch, capsys, tmp_pa
     m = load()
     monkeypatch.setattr(m, "OUTPUT_FILE", str(tmp_path / "codex-review.txt"))
     monkeypatch.setattr(m, "git_changed_files", lambda commit: ["a.py"])
-    monkeypatch.setattr(m.subprocess, "Popen", FakeProc)
+    real_popen = subprocess.Popen
+    # only the codex process is faked; git (resolving the commit) runs for real
+    monkeypatch.setattr(m.subprocess, "Popen",
+                        lambda cmd, **kw: FakeProc(cmd, **kw) if cmd and cmd[0] == "codex" else real_popen(cmd, **kw))
     monkeypatch.setattr(sys, "argv", ["codex-review", "--commit", "abc1234"])
     monkeypatch.delenv("CODEX_REVIEW_MODEL", raising=False)
     monkeypatch.delenv("CODEX_REVIEW_EFFORT", raising=False)
