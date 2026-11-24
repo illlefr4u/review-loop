@@ -109,7 +109,7 @@ def test_main_runs_build_cmd_and_announces_the_model(monkeypatch, capsys, tmp_pa
         m.main()
     except SystemExit as e:
         assert e.code in (0, None)
-    assert FakeProc.cmd == m.build_cmd("commit", commit="abc1234", env={})
+    assert FakeProc.cmd == m.build_cmd("commit", commit="abc1234", env={}, mcp_args=m.MCP_BASE_ARGS)
     assert "Model: gpt-6.1-terra / max" in capsys.readouterr().out
 
 

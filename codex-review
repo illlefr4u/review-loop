@@ -18,6 +18,16 @@ raise it for large diffs). Callers (Claude Code Bash tool) must NOT set a
 smaller outer timeout — run in background and wait for completion instead (a 5-min outer
 timeout killed a healthy review mid-run, real fail 2026-07-11).
 Model overrides: CODEX_REVIEW_MODEL and CODEX_REVIEW_EFFORT (empty values are ignored).
+Reviews use the user's Codex home and configuration. The wrapper turns off the
+plugins, apps, agent_message_board_mcp, and skill_mcp_dependency_install features
+with `-c features.<name>=false`, which lets older Codex versions ignore unknown
+features. Codex creates the message-board server when a session starts with
+multi_agent_v2 and omits it from the listing. A skill mentioned during review can
+otherwise install an MCP server into the user's configuration. The wrapper
+encodes each enabled server name as a quoted TOML key in a single
+`-c mcp_servers=` inline table because separate overrides replace each other.
+The review starts only after Codex confirms that no listed server is enabled
+and each feature switched off is either disabled or absent from a non-empty feature list.
 The wrapper reports cyber_policy refusals and prints a manual Daybreak Blue
 command for commit and architecture reviews. It never runs Daybreak itself.
 CODEX_REVIEW_DAYBREAK_MODEL and CODEX_REVIEW_DAYBREAK_EFFORT configure the printed command.
@@ -46,6 +56,68 @@ DAYBREAK_GIT_ENV_PREFIX = (
     "env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_COMMON_DIR "
     "-u GIT_OBJECT_DIRECTORY GIT_NO_REPLACE_OBJECTS=1 "
 )
+MCP_LIST_TIMEOUT = 120
+MCP_BASE_ARGS = [
+    "-c", "features.plugins=false",
+    "-c", "features.apps=false",
+    "-c", "features.agent_message_board_mcp=false",
+    "-c", "features.skill_mcp_dependency_install=false",
+]
+# Quote the check's source so the printed shell command fits on one line.
+MCP_GUARD_CHECK = "exec({!r})".format("""\
+import json
+import subprocess
+import sys
+
+
+def run_listing(command):
+    listing = " ".join(command[:3])
+    try:
+        result = subprocess.run([*command, *sys.argv[1:]], capture_output=True, text=True, timeout=%d)
+    except subprocess.TimeoutExpired as exc:
+        sys.exit(
+            f"{listing} timed out after {exc.timeout}s. "
+            "An enabled HTTP MCP server may be slow to respond to OAuth discovery."
+        )
+    except (OSError, UnicodeError) as exc:
+        sys.exit(f"Cannot read {listing} output: {exc}")
+    if result.returncode != 0:
+        detail = result.stderr.strip() or "no stderr output"
+        sys.exit(f"{listing} exited with code {result.returncode}: {detail}")
+    return result.stdout
+
+
+server_output = run_listing(["codex", "mcp", "list", "--json"])
+
+try:
+    servers = json.loads(server_output)
+except (ValueError, RecursionError) as exc:
+    sys.exit(f"Invalid MCP server listing: {exc}")
+
+if not isinstance(servers, list) or not all(isinstance(server, dict) for server in servers):
+    sys.exit("Invalid MCP server listing: expected a JSON list of objects")
+
+remaining = [repr(server.get("name", "<unnamed>")) for server in servers if server.get("enabled") is not False]
+if remaining:
+    sys.exit("MCP servers not confirmed disabled: " + ", ".join(remaining))
+
+feature_output = run_listing(["codex", "features", "list"])
+if not feature_output.strip():
+    sys.exit("Invalid codex features list output: no non-blank lines")
+features_to_disable = {
+    value[len("features."):-len("=false")]
+    for flag, value in zip(sys.argv[1:], sys.argv[2:])
+    if flag == "-c" and value.startswith("features.") and value.endswith("=false")
+}
+for line in feature_output.splitlines():
+    fields = line.split()
+    if not fields:
+        continue
+    if len(fields) < 2 or fields[-1] not in ("true", "false"):
+        sys.exit(f"Invalid codex features list output: {line!r}")
+    if fields[0] in features_to_disable and fields[-1] == "true":
+        sys.exit(f"Codex feature still enabled: {fields[0]}")
+""" % MCP_LIST_TIMEOUT)
 # Max-effort reviews took up to 1326s on small commits under parallel load, so the default limit is 2400s.
 # Large diffs (hundreds of changed lines in one commit) may still not finish and fail with
 # "ERROR: Codex timed out". That is not a verdict but a lost review; raise the limit for such runs:
@@ -63,6 +135,94 @@ ARCH_PROMPT = (
     "P2 (operational risk, degraded reliability), P3 (improvement, defense-in-depth). "
     "If there are no P1 findings, explicitly state 'No P1 findings.' at the top."
 )
+
+
+class McpIsolationError(Exception):
+    """Codex could not confirm that the MCP servers and related features were disabled."""
+
+
+def _toml_basic_key(name):
+    """Encode a server name as a TOML basic string key."""
+    parts = ['"']
+    for char in name:
+        codepoint = ord(char)
+        if char in ('"', "\\"):
+            parts.append("\\" + char)
+        elif codepoint < 0x20 or codepoint == 0x7F:
+            parts.append(f"\\u{codepoint:04X}")
+        else:
+            parts.append(char)
+    parts.append('"')
+    return "".join(parts)
+
+
+def mcp_off_args(cwd=None, env=None):
+    """Build and verify the switches that disable MCP servers and related features."""
+    def run_listing(command, args):
+        listing = " ".join(command[:3])
+        try:
+            result = subprocess.run(
+                [*command, *args],
+                cwd=cwd, env=env, capture_output=True, text=True, timeout=MCP_LIST_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise McpIsolationError(
+                f"{listing} timed out after {exc.timeout}s. "
+                "An enabled HTTP MCP server may be slow to respond to OAuth discovery."
+            ) from exc
+        except OSError as exc:
+            raise McpIsolationError(f"Cannot run {listing}: {exc}") from exc
+        except UnicodeError as exc:
+            raise McpIsolationError(f"Cannot decode {listing} output: {exc}") from exc
+        if result.returncode != 0:
+            detail = result.stderr.strip() or "no stderr output"
+            raise McpIsolationError(f"{listing} exited with code {result.returncode}: {detail}")
+        return result.stdout
+
+    def list_servers(args):
+        output = run_listing(["codex", "mcp", "list", "--json"], args)
+        try:
+            servers = json.loads(output)
+        except (ValueError, RecursionError) as exc:
+            raise McpIsolationError(f"Invalid JSON from codex mcp list: {exc}") from exc
+        if not isinstance(servers, list) or not all(
+            isinstance(server, dict) and isinstance(server.get("name"), str)
+            and isinstance(server.get("enabled"), bool) for server in servers
+        ):
+            raise McpIsolationError(
+                "Invalid codex mcp list output: expected a JSON list of objects with a string name and a boolean enabled"
+            )
+        return servers
+
+    args = list(MCP_BASE_ARGS)
+    entries = [
+        _toml_basic_key(server["name"]) + "={enabled=false}"
+        for server in list_servers(MCP_BASE_ARGS) if server["enabled"]
+    ]
+    if entries:
+        args.extend(("-c", "mcp_servers={" + ",".join(entries) + "}"))
+
+    remaining = [repr(server["name"]) for server in list_servers(args) if server["enabled"]]
+    if remaining:
+        raise McpIsolationError("MCP servers still enabled: " + ", ".join(remaining))
+
+    feature_output = run_listing(["codex", "features", "list"], args)
+    if not feature_output.strip():
+        raise McpIsolationError("Invalid codex features list output: no non-blank lines")
+    features_to_disable = {
+        value[len("features."):-len("=false")]
+        for flag, value in zip(MCP_BASE_ARGS, MCP_BASE_ARGS[1:])
+        if flag == "-c" and value.startswith("features.") and value.endswith("=false")
+    }
+    for line in feature_output.splitlines():
+        fields = line.split()
+        if not fields:
+            continue
+        if len(fields) < 2 or fields[-1] not in ("true", "false"):
+            raise McpIsolationError(f"Invalid codex features list output: {line!r}")
+        if fields[0] in features_to_disable and fields[-1] == "true":
+            raise McpIsolationError(f"Codex feature still enabled: {fields[0]}")
+    return args
 
 
 def _model_config(env=None):
@@ -180,25 +340,29 @@ def daybreak_review_prompt(commit) -> str:
     )
 
 
-def daybreak_command(mode, *, commit=None, prompt=None, env=None):
+def daybreak_command(mode, *, commit=None, prompt=None, env=None, mcp_args=()):
     """Build the Daybreak Blue command to print for a manual review."""
     if mode == "commit":
         prompt = daybreak_review_prompt(commit)
     elif mode != "arch":
         raise ValueError(f"unsupported Daybreak review mode: {mode}")
     return [
-        "codex", "exec", *daybreak_model_args(env), "--cyber-access-program",
+        "codex", "exec", *daybreak_model_args(env), *mcp_args, "--cyber-access-program",
         DAYBREAK_PROGRAM, "-s", "read-only", prompt,
     ]
 
 
-def report_cyber_policy_refusal(stderr_text, mode, target, *, pin_sha=None):
+def report_cyber_policy_refusal(stderr_text, mode, target, *, pin_sha=None, mcp_args=()):
     session_id = _session_id(stderr_text)
     print(f"Review stopped by OpenAI's cyber_policy filter (session id: {session_id}).", file=sys.stderr)
     if mode == "unpushed":
         return
 
-    command = DAYBREAK_GIT_ENV_PREFIX + shlex.join(daybreak_command(mode, **target))
+    command = (
+        DAYBREAK_GIT_ENV_PREFIX + "python3 -I -c " + shlex.quote(MCP_GUARD_CHECK)
+        + " " + shlex.join(mcp_args) + " && "
+        + DAYBREAK_GIT_ENV_PREFIX + shlex.join(daybreak_command(mode, **target, mcp_args=mcp_args))
+    )
     worktree_sha = target["commit"] if mode == "commit" else pin_sha
     if worktree_sha is not None:
         print(
@@ -217,15 +381,21 @@ def report_cyber_policy_refusal(stderr_text, mode, target, *, pin_sha=None):
         print(f"Run the following Daybreak Blue command manually.\n{command}", file=sys.stderr)
     print(
         "WARNING — OpenAI may use the Daybreak session for training.\n"
-        "WARNING — The Daybreak agent can read any file on this machine and call any MCP tool configured for Codex.\n"
+        "WARNING — The Daybreak agent can read any file on this machine.\n"
+        "WARNING — The command starts Codex only if `codex mcp list` with the same switches "
+        "shows no enabled MCP server and `codex features list` confirms the feature overrides "
+        "in the directory where it runs.\n"
+        "WARNING — An `invalid transport` error from the server check means this directory lacks an MCP server "
+        "the review switched off (for example, one from an uncommitted project config). "
+        "Rerun the review with `--pin`.\n"
         "WARNING — The manual review does not count toward the deploy gate.",
         file=sys.stderr,
     )
 
 
-def build_cmd(mode, *, commit=None, base=None, prompt=None, env=None):
+def build_cmd(mode, *, commit=None, base=None, prompt=None, env=None, mcp_args=()):
     """Build a Codex command for one of the supported review modes."""
-    args = [*model_args(env), "-c", "daybreak=false"]
+    args = [*model_args(env), "-c", "daybreak=false", *mcp_args]
     if mode == "commit":
         return ["codex", "review", *args, "--commit", commit]
     if mode == "unpushed":
@@ -453,13 +623,14 @@ def run_review(args, record):
 
     model, effort = _model_config()
     print(f"Model: {model} / {effort}", flush=True)
-    returncode, stdout_lines, stderr_text = run_codex(build_cmd(mode, **target), record)
+    mcp_args = mcp_off_args()
+    returncode, stdout_lines, stderr_text = run_codex(build_cmd(mode, **target, mcp_args=mcp_args), record)
 
     if returncode != 0:
         if record is not None:
             record["reason"] = f"Codex exited with code {returncode}"
         if is_cyber_policy_refusal(returncode, stderr_text):
-            report_cyber_policy_refusal(stderr_text, mode, target, pin_sha=pin_sha)
+            report_cyber_policy_refusal(stderr_text, mode, target, pin_sha=pin_sha, mcp_args=mcp_args)
             sys.exit(1)
         if stderr_text:
             report_codex_failure(returncode, stderr_text)

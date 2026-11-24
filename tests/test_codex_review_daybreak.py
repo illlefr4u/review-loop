@@ -8,12 +8,13 @@ Contract of `codex-review` (extensionless script, loaded as a module):
 - `daybreak_model_args(env=None)` has the shape of `model_args` for the Daybreak model: ["-c", 'model="<m>"', "-c",
   'review_model="<m>"', "-c", 'model_reasoning_effort="<e>"']; `CODEX_REVIEW_DAYBREAK_MODEL` / `CODEX_REVIEW_DAYBREAK_EFFORT`
   override it, an empty string means no override;
-- `build_cmd(mode, *, commit=None, base=None, prompt=None, env=None)`: as before the Daybreak work except that the model
-  arguments are followed by "-c", "daybreak=false" (a saved `daybreak = true` must not turn a review into a Daybreak session);
+- `build_cmd(mode, *, commit=None, base=None, prompt=None, env=None, mcp_args=())`: as before the Daybreak work except that the
+  model arguments are followed by "-c", "daybreak=false" (a saved `daybreak = true` must not turn a review into a Daybreak
+  session) and then by `mcp_args` (test_codex_review_no_mcp.py);
 - `daybreak_review_prompt(commit)` names the exact commit, shown with `git show -m --first-parent` (a merge against its first
   parent, in old and new git), asks for findings labelled [P0]–[P3] and says not to modify any files;
-- `daybreak_command(mode, *, commit=None, prompt=None, env=None)` = ["codex", "exec", *daybreak_model_args(env),
-  "--cyber-access-program", "daybreak_blue", "-s", "read-only", PROMPT] for "commit" (PROMPT = daybreak_review_prompt(commit))
+- `daybreak_command(mode, *, commit=None, prompt=None, env=None, mcp_args=())` = ["codex", "exec", *daybreak_model_args(env),
+  *mcp_args, "--cyber-access-program", "daybreak_blue", "-s", "read-only", PROMPT] for "commit" (PROMPT = daybreak_review_prompt(commit))
   and "arch" (the given prompt); "unpushed" → ValueError;
 - `is_cyber_policy_refusal(returncode, stderr_text, codex_home=None)`: true only for a non-zero exit whose own session journal
   has a `task_complete` event with `error.codex_error_info == "cyber_policy"`; the session is the FIRST `session id: <id>` line of
@@ -27,8 +28,9 @@ Contract of `codex-review` (extensionless script, loaded as a module):
   — starts with `env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_COMMON_DIR -u GIT_OBJECT_DIRECTORY
   GIT_NO_REPLACE_OBJECTS=1`, so an exported index or work tree of the original shell is never touched; an unpinned --arch review
   gets the command alone (it reviewed the current checkout);
-  with warnings that OpenAI may use a Daybreak session for training, that its agent can read any file on this machine and call
-  every MCP tool configured for Codex, and that the manual run does not count for the deploy gate; for --unpushed there is no
+  with warnings that OpenAI may use a Daybreak session for training, that its agent can read any file on this machine, that Codex
+  starts only if `codex mcp list` with the command's switches shows no enabled server (test_codex_review_no_mcp.py), and that the manual run does not count
+  for the deploy gate; the printed command carries those switches (here none are configured: `MCP_BASE_ARGS`); for --unpushed there is no
   command; codex runs exactly once, no record is written, and the wrapper exits 1 even if the refused run printed output;
 - the completion record is as before the Daybreak work: no "daybreak" and no "model" fields.
 """
@@ -205,13 +207,13 @@ def test_a_refused_pinned_review_prints_the_manual_daybreak_command_and_runs_cod
     assert "daybreak=false" in ScriptedCodex.calls[0] and ScriptedCodex.calls[0][:2] == ["codex", "review"]
     err = capsys.readouterr().err
     assert any("cyber_policy" in line and FIRST in line for line in err.splitlines()), "one line names the refusal and its session"
-    assert shlex.join(m.daybreak_command("commit", commit=heads[0])) in err
+    assert shlex.join(m.daybreak_command("commit", commit=heads[0], mcp_args=m.MCP_BASE_ARGS)) in err
     low = err.lower()
     assert all(word in low for word in ("training", "deploy", "mcp", "any file", "worktree")), "the risks and the fresh checkout"
     env = "env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_COMMON_DIR -u GIT_OBJECT_DIRECTORY GIT_NO_REPLACE_OBJECTS=1"
     assert f"{env} git -c core.hooksPath=/dev/null worktree add --detach <dir> {heads[0]}" in err, "clean Git env, no hooks"
     assert f"{env} git -C <dir> status --porcelain" in err, "the clean-tree check uses the same clean Git environment"
-    assert f"{env} {shlex.join(m.daybreak_command('commit', commit=heads[0]))}" in err
+    assert f"{env} {shlex.join(m.daybreak_command('commit', commit=heads[0], mcp_args=m.MCP_BASE_ARGS))}" in err
 
 
 def test_a_refused_unpinned_review_names_the_commit_it_reviewed(repo, monkeypatch, tmp_path, capsys):
@@ -220,7 +222,7 @@ def test_a_refused_unpinned_review_names_the_commit_it_reviewed(repo, monkeypatc
     code, recs, m = review(monkeypatch, tmp_path, ["--commit", "HEAD"], [([], REFUSAL_ERR, 1)])
     assert code == 1 and len(ScriptedCodex.calls) == 1
     assert ScriptedCodex.calls[0][ScriptedCodex.calls[0].index("--commit") + 1] == heads[0], "resolved before the run"
-    assert shlex.join(m.daybreak_command("commit", commit=heads[0])) in capsys.readouterr().err
+    assert shlex.join(m.daybreak_command("commit", commit=heads[0], mcp_args=m.MCP_BASE_ARGS)) in capsys.readouterr().err
 
 
 def test_a_refused_architecture_review_prints_the_command_with_its_prompt(repo, monkeypatch, tmp_path, capsys):
@@ -229,7 +231,7 @@ def test_a_refused_architecture_review_prints_the_command_with_its_prompt(repo, 
     assert code == 1 and len(ScriptedCodex.calls) == 1
     prompt = ScriptedCodex.calls[0][-1]
     err = capsys.readouterr().err
-    assert shlex.join(m.daybreak_command("arch", prompt=prompt)) in err
+    assert shlex.join(m.daybreak_command("arch", prompt=prompt, mcp_args=m.MCP_BASE_ARGS)) in err
     assert "worktree add" not in err, "an unpinned architecture review reviewed the current checkout"
 
 
@@ -240,7 +242,7 @@ def test_a_refused_pinned_architecture_review_recreates_the_pinned_checkout(repo
     assert code == 1 and len(ScriptedCodex.calls) == 1
     err = capsys.readouterr().err
     assert f"git -c core.hooksPath=/dev/null worktree add --detach <dir> {heads[1]}" in err
-    assert shlex.join(m.daybreak_command("arch", prompt=ScriptedCodex.calls[0][-1])) in err
+    assert shlex.join(m.daybreak_command("arch", prompt=ScriptedCodex.calls[0][-1], mcp_args=m.MCP_BASE_ARGS)) in err
 
 
 @pytest.mark.parametrize("argv", [["--pin", "HEAD", "--unpushed"], ["--unpushed"]])
